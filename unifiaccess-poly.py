@@ -409,6 +409,12 @@ class Controller(udi_interface.Node):
                 node = self._node_for_door(target.get('id', ''))
                 if node:
                     node.set_access_result(granted)
+                    # Pulse: reset after 3s so every auth fires a fresh ISY trigger
+                    self._async.submit(self._reset_access_result(node))
+
+    async def _reset_access_result(self, node):
+        await asyncio.sleep(3)
+        node.set_access_result(False)
 
     # ------------------------------------------------------------------
     # Unlock (called from DoorNode)
