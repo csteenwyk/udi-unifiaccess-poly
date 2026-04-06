@@ -2,4 +2,7 @@
   <editor id="E_STATUS">
     <range uom="2" subset="0,1"/>
   </editor>
+  <editor id="E_AUTH_METHOD">
+    <range uom="56" subset="0,1,2,3,4" nls="AUTH_METHOD"/>
+  </editor>
 </editors>

@@ -12,8 +12,17 @@ CMD-access_controller-QUERY-NAME = Query All
 # Door Drivers
 ST-access_door-ST-NAME = Door Open
 ST-access_door-GV1-NAME = Locked
-ST-access_door-GV2-NAME = Last Access Granted
+ST-access_door-GV2-NAME = Access Granted
+ST-access_door-GV3-NAME = Access Denied
+ST-access_door-GV4-NAME = Last Auth Method
 
 # Door Commands
 CMD-access_door-QUERY-NAME = Query
 CMD-access_door-UNLOCK-NAME = Unlock
+
+# Auth Method values
+AUTH_METHOD-0 = Unknown
+AUTH_METHOD-1 = NFC / Card
+AUTH_METHOD-2 = PIN
+AUTH_METHOD-3 = Face ID
+AUTH_METHOD-4 = Mobile

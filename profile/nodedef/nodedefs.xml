@@ -17,9 +17,11 @@
   <!-- Door Node -->
   <nodeDef id="access_door" nodeType="139" nls="access_door">
     <sts>
-      <st id="ST"  editor="E_STATUS"/>  <!-- Door open -->
-      <st id="GV1" editor="E_STATUS"/>  <!-- Locked -->
-      <st id="GV2" editor="E_STATUS"/>  <!-- Last access granted -->
+      <st id="ST"  editor="E_STATUS"/>    <!-- Door open -->
+      <st id="GV1" editor="E_STATUS"/>    <!-- Locked -->
+      <st id="GV2" editor="E_STATUS"/>    <!-- Access granted (pulse) -->
+      <st id="GV3" editor="E_STATUS"/>    <!-- Access denied (pulse) -->
+      <st id="GV4" editor="E_AUTH_METHOD"/> <!-- Last auth method -->
     </sts>
     <cmds>
       <sends/>

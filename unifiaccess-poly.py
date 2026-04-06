@@ -153,7 +153,9 @@ class DoorNode(udi_interface.Node):
     drivers = [
         {'driver': 'ST',  'value': 0, 'uom': 2},  # door position: open=1 closed=0
         {'driver': 'GV1', 'value': 1, 'uom': 2},  # lock status: locked=1 unlocked=0
-        {'driver': 'GV2', 'value': 0, 'uom': 2},  # last access: granted=1 denied=0
+        {'driver': 'GV2', 'value': 0, 'uom': 2},  # access granted (pulse)
+        {'driver': 'GV3', 'value': 0, 'uom': 2},  # access denied (pulse)
+        {'driver': 'GV4', 'value': 0, 'uom': 56}, # last auth method: 0=unknown 1=NFC 2=PIN 3=Face 4=Mobile
     ]
 
     def __init__(self, polyglot, primary, address, name, door_id):
@@ -172,8 +174,26 @@ class DoorNode(udi_interface.Node):
         """status: 'lock'/'locked' = 1, 'unlock'/'unlocked' = 0"""
         self._set('GV1', status in ('lock', 'locked'))
 
-    def set_access_result(self, granted: bool):
-        self._set('GV2', granted)
+    def set_access_granted(self):
+        self._set('GV2', True)
+
+    def set_access_denied(self):
+        self._set('GV3', True)
+
+    def set_auth_method(self, method: str):
+        mapping = {
+            'nfc':    1,
+            'card':   1,
+            'pin':    2,
+            'face':   3,
+            'mobile': 4,
+        }
+        val = 0
+        for key, num in mapping.items():
+            if key in method.lower():
+                val = num
+                break
+        self.setDriver('GV4', val, report=True, force=True)
 
     def query(self, command=None):
         self.reportDrivers()
@@ -398,9 +418,15 @@ class Controller(udi_interface.Node):
 
     def _handle_log_event(self, data: dict):
         # data.source.event.result: ACCESS_GRANTED / ACCESS_DENIED / BLOCKED
-        source = data.get('source', {})
-        result = (source.get('event') or {}).get('result', '')
+        source  = data.get('source', {})
+        result  = (source.get('event') or {}).get('result', '')
         granted = 'GRANTED' in result
+
+        # Actor name and auth method for logging
+        actor  = (source.get('actor') or {})
+        name   = actor.get('display_name') or actor.get('name') or 'Unknown'
+        auth   = (source.get('authentication') or {})
+        method = auth.get('credential_provider') or auth.get('type') or ''
 
         # Find which door(s) this event targets
         targets = source.get('target', [])
@@ -408,13 +434,19 @@ class Controller(udi_interface.Node):
             if target.get('type') == 'door':
                 node = self._node_for_door(target.get('id', ''))
                 if node:
-                    node.set_access_result(granted)
-                    # Pulse: reset after 3s so every auth fires a fresh ISY trigger
-                    self._async.submit(self._reset_access_result(node))
+                    status = 'GRANTED' if granted else 'DENIED'
+                    LOGGER.info(f'Access {status}: {name} via {method or "unknown"} at {node.name}')
+                    node.set_auth_method(method)
+                    if granted:
+                        node.set_access_granted()
+                        self._async.submit(self._reset_pulse(node, 'GV2'))
+                    else:
+                        node.set_access_denied()
+                        self._async.submit(self._reset_pulse(node, 'GV3'))
 
-    async def _reset_access_result(self, node):
+    async def _reset_pulse(self, node, driver: str):
         await asyncio.sleep(3)
-        node.set_access_result(False)
+        node.setDriver(driver, 0, report=True, force=False)
 
     # ------------------------------------------------------------------
     # Unlock (called from DoorNode)
