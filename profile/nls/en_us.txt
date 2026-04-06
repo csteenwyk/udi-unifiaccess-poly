@@ -1,0 +1,19 @@
+# Node Server Names
+ND-access_controller-NAME = UniFi Access Controller
+ND-access_door-NAME = UniFi Door
+
+# Controller Drivers
+ST-access_controller-ST-NAME = Status
+
+# Controller Commands
+CMD-access_controller-DISCOVER-NAME = Re-Discover
+CMD-access_controller-QUERY-NAME = Query All
+
+# Door Drivers
+ST-access_door-ST-NAME = Door Open
+ST-access_door-GV1-NAME = Locked
+ST-access_door-GV2-NAME = Last Access Granted
+
+# Door Commands
+CMD-access_door-QUERY-NAME = Query
+CMD-access_door-UNLOCK-NAME = Unlock

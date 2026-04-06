@@ -1,0 +1,5 @@
+<editors>
+  <editor id="E_STATUS">
+    <range uom="2" subset="0,1"/>
+  </editor>
+</editors>

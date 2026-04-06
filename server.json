@@ -1,0 +1,36 @@
+{
+    "name": "UniFi Access",
+    "docs": "https://github.com/csteenwyk/udi-unifiaccess-poly",
+    "type": "python3",
+    "executable": "unifiaccess-poly.py",
+    "install": "install.sh",
+    "description": "UniFi Access doors as ISY nodes. Shows door position, lock status, and access results. Doors can be unlocked from ISY programs.",
+    "shortPoll": "60",
+    "longPoll": "300",
+    "logLevel": "INFO",
+    "customParams": {
+        "host": "",
+        "port": "12445",
+        "api_token": "",
+        "verify_ssl": "false"
+    },
+    "credits": [
+        {
+            "title": "UniFi Access NodeServer",
+            "author": "csteenwyk",
+            "version": "1.0.0",
+            "date": "April 2026",
+            "source": "https://github.com/csteenwyk/udi-unifiaccess-poly",
+            "license": "https://github.com/csteenwyk/udi-unifiaccess-poly/blob/main/LICENSE"
+        }
+    ],
+    "store": {
+        "developer": "5737892+csteenwyk@users.noreply.github.com",
+        "purchaseOptions": [
+            {
+                "isPerpetual": true,
+                "price": 0
+            }
+        ]
+    }
+}
