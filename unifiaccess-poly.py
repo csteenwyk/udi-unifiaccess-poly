@@ -187,7 +187,7 @@ AUTH_METHOD-2 = PIN
 AUTH_METHOD-3 = Face ID
 AUTH_METHOD-4 = Mobile
 
-# Users (GV1) — extended dynamically at runtime
+# Users (GV1) - extended dynamically at runtime
 """
 
 

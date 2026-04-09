@@ -2,7 +2,6 @@
   <editor id="E_STATUS">
     <range uom="2" subset="0,1"/>
   </editor>
-  <!-- Fixed range 0-30 — NLS provides names, new users just extend the list -->
   <editor id="E_AUTH_USER">
     <range uom="56" subset="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30" nls="AUTH_USER"/>
   </editor>
