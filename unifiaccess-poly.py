@@ -480,7 +480,13 @@ class Controller(udi_interface.Node):
         self._users.load()
         if users_csv:
             self._users.seed_from_config(users_csv)
-        self._save_and_rebuild_profile()
+        write_nls(self._users)
+        self._users.save()
+        try:
+            self.poly.updateProfile()
+            LOGGER.info('Profile uploaded to ISY')
+        except Exception as e:
+            LOGGER.warning(f'updateProfile failed: {e}')
 
         self._async.submit(self._connect(host, port, api_token, verify))
 
@@ -489,6 +495,8 @@ class Controller(udi_interface.Node):
             LOGGER.info(f'Connecting to UniFi Access at {host}:{port}')
             self._client = AccessClient(host, port, api_token, verify_ssl)
             await self._client.connect()
+            # Give ISY a moment to process the profile update before adding nodes
+            await asyncio.sleep(3)
             await self._fetch_and_discover()
             LOGGER.info('Listening for WebSocket events')
             await self._ws_loop()
