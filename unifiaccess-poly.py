@@ -362,7 +362,7 @@ class WebhookServer:
             await self._runner.cleanup()
             self._runner = None
 
-    async def _handle(self, request: aiohttp.web.Request):
+    async def _handle(self, request):
         try:
             body = await request.json()
             event = body.get('event', '')
