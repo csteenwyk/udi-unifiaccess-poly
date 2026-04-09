@@ -49,9 +49,13 @@ _AUTH_METHOD_MAP = {
     'mobile': 4, 'bluetooth': 4, 'app': 4,
 }
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_NLS_PATH   = os.path.join(_SCRIPT_DIR, 'profile', 'nls', 'en_us.txt')
+_SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
+_NLS_PATH      = os.path.join(_SCRIPT_DIR, 'profile', 'nls', 'en_us.txt')
 _USER_MAP_FILE = os.path.join(_SCRIPT_DIR, 'usermap.json')
+_WEBHOOK_FILE  = os.path.join(_SCRIPT_DIR, 'webhook.json')
+
+_WEBHOOK_EVENTS = ['access.doorbell.incoming', 'access.doorbell.incoming.REN']
+_WEBHOOKS_URL   = _API_BASE + '/webhooks/endpoints'
 
 
 def _make_address(raw_id: str) -> str:
@@ -272,6 +276,29 @@ class AccessClient:
                     LOGGER.warning(f'WebSocket {msg.type}')
                     break
 
+    async def register_webhook(self, url: str, webhook_id: str = None) -> dict:
+        payload = {'name': 'udi-unifiaccess-poly',
+                   'endpoint': url, 'events': _WEBHOOK_EVENTS}
+        if webhook_id:
+            resp = await self._session.put(
+                self._url(f'{_WEBHOOKS_URL}/{webhook_id}'),
+                headers=self._headers(), ssl=self._ssl, json=payload)
+        else:
+            resp = await self._session.post(
+                self._url(_WEBHOOKS_URL),
+                headers=self._headers(), ssl=self._ssl, json=payload)
+        resp.raise_for_status()
+        return (await resp.json()).get('data', {})
+
+    async def delete_webhook(self, webhook_id: str):
+        try:
+            resp = await self._session.delete(
+                self._url(f'{_WEBHOOKS_URL}/{webhook_id}'),
+                headers=self._headers(), ssl=self._ssl)
+            resp.raise_for_status()
+        except Exception as e:
+            LOGGER.warning(f'Failed to delete webhook {webhook_id}: {e}')
+
     async def reconnect(self):
         await self.close()
         await self.connect()
@@ -307,6 +334,43 @@ class _AsyncBridge:
     def shutdown(self):
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Webhook HTTP server
+# ---------------------------------------------------------------------------
+
+class WebhookServer:
+    """Tiny aiohttp server that receives doorbell POSTs from UniFi Access."""
+
+    def __init__(self, port: int, on_doorbell):
+        self._port       = port
+        self._on_doorbell = on_doorbell
+        self._runner     = None
+
+    async def start(self):
+        app = aiohttp.web.Application()
+        app.router.add_post('/webhook', self._handle)
+        self._runner = aiohttp.web.AppRunner(app)
+        await self._runner.setup()
+        await aiohttp.web.TCPSite(self._runner, '0.0.0.0', self._port).start()
+        LOGGER.info(f'Webhook server listening on port {self._port}')
+
+    async def stop(self):
+        if self._runner:
+            await self._runner.cleanup()
+            self._runner = None
+
+    async def _handle(self, request: aiohttp.web.Request):
+        try:
+            body = await request.json()
+            event = body.get('event', '')
+            if event in ('access.doorbell.incoming', 'access.doorbell.incoming.REN'):
+                LOGGER.info(f'Webhook doorbell: {event}')
+                await self._on_doorbell(body.get('data', {}))
+        except Exception as e:
+            LOGGER.error(f'Webhook handler error: {e}')
+        return aiohttp.web.Response(text='OK')
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +461,8 @@ class Controller(udi_interface.Node):
 
         self._async             = _AsyncBridge()
         self._client            = None
+        self._webhook_server    = None
+        self._webhook_id        = None
         self._doors             = {}   # address     → DoorNode
         self._door_by_id        = {}   # door_id     → DoorNode
         self._readers           = {}   # address     → ReaderNode
@@ -427,6 +493,10 @@ class Controller(udi_interface.Node):
 
     def stop(self):
         LOGGER.info('Stopping UniFi Access nodeserver')
+        if self._client and self._webhook_id:
+            self._async.run(self._client.delete_webhook(self._webhook_id), timeout=10)
+        if self._webhook_server:
+            self._async.run(self._webhook_server.stop(), timeout=5)
         if self._client:
             self._async.run(self._client.close(), timeout=10)
         self._async.shutdown()
@@ -470,12 +540,14 @@ class Controller(udi_interface.Node):
         # Set flag first to prevent double-connect if both callbacks fire
         self._initialized = True
 
-        params    = self._params
-        host      = (params.get('host')      or '').strip()
-        api_token = (params.get('api_token') or '').strip()
-        port      = int((params.get('port')  or '12445').strip())
-        verify    = (params.get('verify_ssl') or 'false').strip().lower() == 'true'
-        users_csv = (params.get('users')     or '').strip()
+        params        = self._params
+        host          = (params.get('host')         or '').strip()
+        api_token     = (params.get('api_token')    or '').strip()
+        port          = int((params.get('port')     or '12445').strip())
+        verify        = (params.get('verify_ssl')   or 'false').strip().lower() == 'true'
+        users_csv     = (params.get('users')        or '').strip()
+        webhook_host  = (params.get('webhook_host') or '').strip()
+        webhook_port  = int((params.get('webhook_port') or '7777').strip())
 
         if not host or not api_token:
             self._initialized = False
@@ -492,13 +564,20 @@ class Controller(udi_interface.Node):
         except Exception as e:
             LOGGER.warning(f'updateProfile failed: {e}')
 
-        self._async.submit(self._connect(host, port, api_token, verify))
+        self._async.submit(
+            self._connect(host, port, api_token, verify, webhook_host, webhook_port))
 
-    async def _connect(self, host, port, api_token, verify_ssl):
+    async def _connect(self, host, port, api_token, verify_ssl,
+                       webhook_host='', webhook_port=7777):
         try:
             LOGGER.info(f'Connecting to UniFi Access at {host}:{port}')
             self._client = AccessClient(host, port, api_token, verify_ssl)
             await self._client.connect()
+
+            # Start webhook server if configured
+            if webhook_host:
+                await self._start_webhook(webhook_host, webhook_port)
+
             # Give ISY a moment to process the profile update before adding nodes
             await asyncio.sleep(3)
             await self._fetch_and_discover()
@@ -662,8 +741,23 @@ class Controller(udi_interface.Node):
             LOGGER.info(f'Remote unlock: {door.name}')
 
     def _handle_doorbell(self, data: dict):
+        # WebSocket access.remote_view: data.device_id = reader device ID
         dev_id = data.get('device_id') or data.get('deviceId') or data.get('id') or ''
+        self._ring_doorbell(dev_id=dev_id, door_id=None)
+
+    async def _on_webhook_doorbell(self, data: dict):
+        # Webhook access.doorbell.incoming: data.device.id, data.location.id
+        dev_id  = (data.get('device')   or {}).get('id', '')
+        door_id = (data.get('location') or {}).get('id', '')
+        self._ring_doorbell(dev_id=dev_id, door_id=door_id)
+
+    def _ring_doorbell(self, dev_id: str, door_id: str):
         reader = self._reader_by_dev.get(dev_id)
+        if not reader and door_id:
+            door = self._door_by_id.get(door_id)
+            if door:
+                readers = self._readers_by_door.get(door.address, [])
+                reader = readers[0] if readers else None
         if not reader and self._readers:
             reader = next(iter(self._readers.values()))
         if reader:
@@ -671,7 +765,7 @@ class Controller(udi_interface.Node):
             asyncio.create_task(self._reset_driver(reader, 'ST'))
             LOGGER.info(f'Doorbell ring: {reader.name}')
         else:
-            LOGGER.info(f'Doorbell from unknown device {dev_id!r}')
+            LOGGER.info(f'Doorbell: no reader found (dev={dev_id!r} door={door_id!r})')
 
     async def _handle_log_event(self, data: dict):
         # data.result == 'ACCESS' for granted; everything else in data.metadata
@@ -709,6 +803,35 @@ class Controller(udi_interface.Node):
             reader.set_granted(granted)
             asyncio.create_task(
                 self._reset_driver(reader, 'GV3' if granted else 'GV4'))
+
+    # ------------------------------------------------------------------
+    # Webhook
+    # ------------------------------------------------------------------
+
+    async def _start_webhook(self, webhook_host: str, webhook_port: int):
+        url = f'http://{webhook_host}:{webhook_port}/webhook'
+        # Load persisted webhook ID
+        saved_id = None
+        try:
+            with open(_WEBHOOK_FILE) as f:
+                saved_id = json.load(f).get('id')
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            LOGGER.warning(f'Failed to load webhook state: {e}')
+
+        try:
+            info = await self._client.register_webhook(url, saved_id)
+            self._webhook_id = info.get('id')
+            with open(_WEBHOOK_FILE, 'w') as f:
+                json.dump({'id': self._webhook_id}, f)
+            LOGGER.info(f'Webhook registered: {url} (id={self._webhook_id})')
+        except Exception as e:
+            LOGGER.warning(f'Webhook registration failed: {e}')
+            return
+
+        self._webhook_server = WebhookServer(webhook_port, self._on_webhook_doorbell)
+        await self._webhook_server.start()
 
     # ------------------------------------------------------------------
     # Helpers

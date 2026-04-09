@@ -34,6 +34,8 @@ Set the following in Custom Parameters:
 | `api_token` | API token from the Access app | |
 | `verify_ssl` | Verify SSL certificate | `false` |
 | `users` | Comma-separated list of known user names | |
+| `webhook_host` | eisy IP address (for doorbell webhook receiver) | |
+| `webhook_port` | Port for the webhook HTTP server | `7777` |
 
 ### Creating an API token
 

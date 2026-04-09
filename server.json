@@ -13,7 +13,9 @@
         "port": "12445",
         "api_token": "",
         "verify_ssl": "false",
-        "users": ""
+        "users": "",
+        "webhook_host": "",
+        "webhook_port": "7777"
     },
     "credits": [
         {
