@@ -631,6 +631,8 @@ class Controller(udi_interface.Node):
     async def _on_ws_message(self, event: str, data: dict):
         try:
             LOGGER.debug(f'WS event: {event}')
+            if event in ('access.data.device.update', 'access.data.v2.device.update'):
+                LOGGER.debug(f'Device update data: {data}')
             if event in _LOCATION_EVENTS:
                 self._handle_location_update(data)
             elif event == _EVT_LOG_ADD:
