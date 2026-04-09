@@ -762,7 +762,7 @@ class Controller(udi_interface.Node):
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    polyglot = udi_interface.Interface([])
+    polyglot = udi_interface.Interface([Controller, DoorNode, ReaderNode])
     polyglot.start('2.0.0')
     Controller(polyglot, 'controller', 'controller', 'UniFi Access')
     polyglot.runForever()
