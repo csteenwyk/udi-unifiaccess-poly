@@ -104,18 +104,6 @@ class UserMap:
         except Exception as e:
             LOGGER.warning(f'Failed to save user map: {e}')
 
-    def seed_from_config(self, users_csv: str):
-        for name in filter(None, map(str.strip, users_csv.split(','))):
-            key = name.lower()
-            if key not in self._name_to_num:
-                num = self._next
-                self._next += 1
-                self._uuid_to_num[f'__config__{key}'] = num
-                self._name_to_num[key]                = num
-                self._num_to_name[num]                = name
-                self.changed = True
-                LOGGER.info(f'Pre-configured user: {name} → {num}')
-
     def get_or_add(self, uid: str, display_name: str) -> int:
         if uid and uid in self._uuid_to_num:
             num = self._uuid_to_num[uid]
@@ -565,7 +553,6 @@ class Controller(udi_interface.Node):
         api_token     = (params.get('api_token')    or '').strip()
         port          = int((params.get('port')     or '12445').strip())
         verify        = (params.get('verify_ssl')   or 'false').strip().lower() == 'true'
-        users_csv     = (params.get('users')        or '').strip()
         webhook_host  = (params.get('webhook_host') or '').strip()
         webhook_port  = int((params.get('webhook_port') or '7777').strip())
 
@@ -574,8 +561,6 @@ class Controller(udi_interface.Node):
             return
 
         self._users.load()
-        if users_csv:
-            self._users.seed_from_config(users_csv)
         write_nls(self._users)
         self._users.save()
         try:
