@@ -603,7 +603,7 @@ class Controller(udi_interface.Node):
         LOGGER.info(f'Added door: {name} ({address})')
         return node
 
-    def _ensure_reader(self, dev: dict, primary_address: str):
+    def _ensure_reader(self, dev: dict, door_address: str):
         dev_id = dev.get('id', '')
         if not dev_id:
             return None
@@ -611,12 +611,13 @@ class Controller(udi_interface.Node):
         if address in self._readers:
             return self._readers[address]
         name = dev.get('alias') or dev.get('name') or dev_id
-        node = ReaderNode(self.poly, primary_address, address, name, dev_id)
+        # ISY only supports 2-level hierarchy; all nodes must be children of controller
+        node = ReaderNode(self.poly, self.address, address, name, dev_id)
         self._add_node_wait(node, timeout=3)
         self._readers[address]      = node
         self._reader_by_dev[dev_id] = node
-        self._readers_by_door.setdefault(primary_address, []).append(node)
-        LOGGER.info(f'Added reader: {name} ({address}) under {primary_address}')
+        self._readers_by_door.setdefault(door_address, []).append(node)
+        LOGGER.info(f'Added reader: {name} ({address}) under {door_address}')
         return node
 
     # ------------------------------------------------------------------
