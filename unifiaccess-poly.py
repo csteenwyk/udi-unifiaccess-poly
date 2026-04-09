@@ -277,6 +277,19 @@ class AccessClient:
                     LOGGER.warning(f'WebSocket {msg.type}')
                     break
 
+    async def find_webhook(self, name: str) -> str | None:
+        """Return the ID of an existing webhook with the given name, or None."""
+        try:
+            resp = await self._session.get(
+                self._url(_WEBHOOKS_URL), headers=self._headers(), ssl=self._ssl)
+            resp.raise_for_status()
+            for wh in (await resp.json()).get('data', []):
+                if wh.get('name') == name:
+                    return wh.get('id')
+        except Exception as e:
+            LOGGER.warning(f'Failed to list webhooks: {e}')
+        return None
+
     async def register_webhook(self, url: str, webhook_id: str = None) -> dict:
         payload = {'name': 'udi-unifiaccess-poly',
                    'endpoint': url, 'events': _WEBHOOK_EVENTS}
@@ -710,9 +723,6 @@ class Controller(udi_interface.Node):
 
     async def _on_ws_message(self, event: str, data: dict):
         try:
-            LOGGER.debug(f'WS event: {event}')
-            if event in ('access.data.device.update', 'access.data.v2.device.update'):
-                LOGGER.debug(f'Device update data: {data}')
             if event in _LOCATION_EVENTS:
                 self._handle_location_update(data)
             elif event == _EVT_LOG_ADD:
@@ -811,7 +821,7 @@ class Controller(udi_interface.Node):
 
     async def _start_webhook(self, webhook_host: str, webhook_port: int):
         url = f'http://{webhook_host}:{webhook_port}/webhook'
-        # Load persisted webhook ID
+        # Load persisted webhook ID, fall back to searching by name
         saved_id = None
         try:
             with open(_WEBHOOK_FILE) as f:
@@ -820,6 +830,11 @@ class Controller(udi_interface.Node):
             pass
         except Exception as e:
             LOGGER.warning(f'Failed to load webhook state: {e}')
+
+        if not saved_id:
+            saved_id = await self._client.find_webhook('udi-unifiaccess-poly')
+            if saved_id:
+                LOGGER.info(f'Found existing webhook by name (id={saved_id})')
 
         try:
             info = await self._client.register_webhook(url, saved_id)
