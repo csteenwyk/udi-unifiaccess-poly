@@ -626,6 +626,7 @@ class Controller(udi_interface.Node):
 
     async def _on_ws_message(self, event: str, data: dict):
         try:
+            LOGGER.debug(f'WS event: {event}')
             if event in (_EVT_LOCATION_UPDATE, _EVT_V2_LOCATION):
                 self._handle_location_update(data)
             elif event == _EVT_LOG_ADD:
@@ -657,6 +658,7 @@ class Controller(udi_interface.Node):
             LOGGER.info(f'Doorbell from unknown device {dev_id!r} — raw: {data}')
 
     async def _handle_log_event(self, data: dict):
+        LOGGER.debug(f'RAW log event data: {data}')
         source  = data.get('source', {})
         result  = (source.get('event') or {}).get('result', '')
         granted = 'GRANTED' in result
