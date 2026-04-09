@@ -34,7 +34,8 @@ _WS_URL      = _API_BASE + '/devices/notifications'
 _EVT_LOCATION_UPDATE = 'access.data.device.location_update_v2'
 _EVT_V2_LOCATION     = 'access.data.v2.location.update'
 _EVT_LOG_ADD         = 'access.logs.insights.add'
-_EVT_DOORBELL        = 'access.hw.door_bell'
+_EVT_DOORBELL        = 'access.remote_view'
+_EVT_REMOTE_UNLOCK   = 'access.data.device.remote_unlock'
 
 _LOCATION_EVENTS = {_EVT_LOCATION_UPDATE, _EVT_V2_LOCATION,
                     'access.data.location.update'}
@@ -636,6 +637,8 @@ class Controller(udi_interface.Node):
                 await self._handle_log_event(data)
             elif event == _EVT_DOORBELL:
                 self._handle_doorbell(data)
+            elif event == _EVT_REMOTE_UNLOCK:
+                self._handle_remote_unlock(data)
         except Exception as e:
             LOGGER.error(f'WS message error: {e}', exc_info=True)
 
@@ -649,16 +652,24 @@ class Controller(udi_interface.Node):
         if state.get('lock'):
             door.set_locked(state['lock'])
 
+    def _handle_remote_unlock(self, data: dict):
+        # data has door fields (unique_id, name, location_type='door')
+        door = self._door_by_id.get(data.get('unique_id', ''))
+        if door:
+            door.set_locked('unlock')
+            LOGGER.info(f'Remote unlock: {door.name}')
+
     def _handle_doorbell(self, data: dict):
-        dev_id = (data.get('device_id') or data.get('deviceId')
-                  or data.get('id') or '')
+        dev_id = data.get('device_id') or data.get('deviceId') or data.get('id') or ''
         reader = self._reader_by_dev.get(dev_id)
+        if not reader and self._readers:
+            reader = next(iter(self._readers.values()))
         if reader:
             reader.ring()
             asyncio.create_task(self._reset_driver(reader, 'ST'))
             LOGGER.info(f'Doorbell ring: {reader.name}')
         else:
-            LOGGER.info(f'Doorbell from unknown device {dev_id!r} — raw: {data}')
+            LOGGER.info(f'Doorbell from unknown device {dev_id!r}')
 
     async def _handle_log_event(self, data: dict):
         # data.result == 'ACCESS' for granted; everything else in data.metadata
