@@ -7,7 +7,8 @@ Integrates UniFi Access doors and readers with the ISY/iOX home automation contr
 - Real-time events via WebSocket (no polling delay)
 - Per-door nodes: position (open/closed), lock status, unlock command
 - Per-reader sub-nodes: doorbell ring, last authenticated user, auth method (NFC/PIN/Face/Mobile), access granted/denied
-- User identification by name — users auto-learned from events, or pre-configured via custom params
+- User identification by name — all Access users loaded automatically on startup
+- Doorbell support via webhook (works with UA-Lite, G6 Entry, and other non-intercom readers)
 - Local API only — no Ubiquiti cloud required
 
 ## Requirements
@@ -33,7 +34,6 @@ Set the following in Custom Parameters:
 | `port` | Access developer API port | `12445` |
 | `api_token` | API token from the Access app | |
 | `verify_ssl` | Verify SSL certificate | `false` |
-| `users` | Comma-separated list of known user names | |
 | `webhook_host` | eisy IP address (for doorbell webhook receiver) | |
 | `webhook_port` | Port for the webhook HTTP server | `7777` |
 
@@ -43,26 +43,37 @@ In the **UniFi Access app** (not the main UniFi OS dashboard):
 
 1. Go to **Settings → Integrations → API Tokens**
 2. Create a new token
-3. Grant **View** on all categories, **Edit** on **Device** (required for unlock)
+3. Grant **View** on all categories and **People & Groups**, **Edit** on **Device** (required for unlock) and **Webhook** (required for doorbell)
 4. Copy the token into the `api_token` custom parameter
 
-### Pre-configuring users
+### Doorbell setup
 
-Set the `users` parameter to a comma-separated list of display names exactly as they appear in UniFi Access:
+The doorbell button sends a webhook-only event (`access.doorbell.incoming`). The plugin registers a webhook automatically on startup — no manual setup required.
+
+You need to:
+
+1. Set `webhook_host` to the eisy's IP address
+2. Ensure your firewall allows the UniFi controller to reach the eisy on the configured `webhook_port` (default 7777)
+
+The webhook is registered automatically and cleaned up when the plugin stops. You can verify it exists via the API:
 
 ```
-users = "John Smith, Jane Smith, Bob Jones"
+curl -sk -H "Authorization: Bearer <token>" https://<host>:12445/api/v1/developer/webhooks/endpoints
 ```
 
-Users are assigned numbers 1, 2, 3… in order. ISY programs will show their names rather than numbers. Any user not in the list is auto-learned the first time they authenticate — the profile updates automatically and their name appears in subsequent ISY program edits.
+### User identification
+
+All users are loaded automatically from the Access API when the plugin starts. Their names appear immediately in the ISY `Last User` dropdown without needing to authenticate first. New users added to Access will be picked up on the next plugin restart.
 
 ## Node Hierarchy
 
 ```
 UniFi Access Controller
 └── Front Door  (door node)
-    └── Front Door Reader  (reader sub-node)
+└── Front Door Reader  (reader sub-node, child of controller)
 ```
+
+Note: ISY supports only two levels of hierarchy, so reader nodes are children of the controller rather than the door.
 
 ### Door Node Drivers
 
@@ -87,7 +98,7 @@ UniFi Access Controller
 | Access Granted | Pulses true on successful authentication |
 | Access Denied | Pulses true on denied authentication |
 
-Granted and Denied drivers pulse true for 3 seconds then reset, so every authentication event reliably triggers ISY programs even if the same user authenticates back-to-back.
+Granted, Denied, and Doorbell Ring drivers pulse true for 3 seconds then reset, so every event reliably triggers ISY programs even if the same user authenticates back-to-back.
 
 ## Example ISY Program
 
@@ -105,14 +116,23 @@ Trigger a different scene based on who authenticated:
 ```
 If
    Control 'Front Door Reader' / Access Granted turns On
-   AND 'Front Door Reader' Last User = John Smith
+   AND 'Front Door Reader' Last User = Chris Steenwyk
 Then
-   Run Program 'John Arrives'
+   Run Program 'Chris Arrives'
+```
+
+Notify when the doorbell is pressed:
+
+```
+If
+   Control 'Front Door Reader' / Doorbell Ring turns On
+Then
+   Send Notification 'Someone at the door'
 ```
 
 ## Firewall
 
-The eisy must be able to reach your UniFi controller on port **12445**. If you have firewall rules blocking IoT → LAN traffic, add an allow rule for the eisy's IP to the controller IP on TCP/12445.
+The eisy must be able to reach your UniFi controller on port **12445**. The UniFi controller must be able to reach the eisy on port **7777** (or your configured `webhook_port`) for doorbell events.
 
 ## License
 
