@@ -36,6 +36,9 @@ _EVT_V2_LOCATION     = 'access.data.v2.location.update'
 _EVT_LOG_ADD         = 'access.logs.insights.add'
 _EVT_DOORBELL        = 'access.hw.door_bell'
 
+_LOCATION_EVENTS = {_EVT_LOCATION_UPDATE, _EVT_V2_LOCATION,
+                    'access.data.location.update'}
+
 _MAX_USERS = 30
 
 _AUTH_METHOD_MAP = {
@@ -627,7 +630,7 @@ class Controller(udi_interface.Node):
     async def _on_ws_message(self, event: str, data: dict):
         try:
             LOGGER.debug(f'WS event: {event}')
-            if event in (_EVT_LOCATION_UPDATE, _EVT_V2_LOCATION):
+            if event in _LOCATION_EVENTS:
                 self._handle_location_update(data)
             elif event == _EVT_LOG_ADD:
                 await self._handle_log_event(data)
@@ -658,16 +661,16 @@ class Controller(udi_interface.Node):
             LOGGER.info(f'Doorbell from unknown device {dev_id!r} — raw: {data}')
 
     async def _handle_log_event(self, data: dict):
-        LOGGER.debug(f'RAW log event data: {data}')
-        source  = data.get('source', {})
-        result  = (source.get('event') or {}).get('result', '')
-        granted = 'GRANTED' in result
+        # data.result == 'ACCESS' for granted; everything else in data.metadata
+        granted  = data.get('result', '') == 'ACCESS'
+        metadata = data.get('metadata', {})
 
-        actor   = source.get('actor') or {}
-        uid     = actor.get('id', '')
-        name    = actor.get('display_name') or actor.get('name') or ''
-        auth    = source.get('authentication') or {}
-        method  = auth.get('credential_provider') or auth.get('type') or ''
+        actor  = metadata.get('actor') or {}
+        uid    = actor.get('id', '')
+        name   = actor.get('display_name') or ''
+
+        auth   = metadata.get('authentication') or {}
+        method = auth.get('credential_provider') or auth.get('display_name') or ''
 
         user_num = self._users.get_or_add(uid, name)
         if self._users.changed:
@@ -677,27 +680,22 @@ class Controller(udi_interface.Node):
         status = 'GRANTED' if granted else 'DENIED'
         LOGGER.info(f'Access {status}: {name or uid} via {method or "?"} (user={user_num})')
 
-        reader = self._reader_by_dev.get(
-            (source.get('device') or {}).get('id') or
-            source.get('device_id') or ''
-        )
+        # Device in metadata is the hub, not the reader — look up by door instead
+        door_id = (metadata.get('door') or {}).get('id', '')
+        door    = self._door_by_id.get(door_id)
+        reader  = None
+        if door:
+            readers = self._readers_by_door.get(door.address, [])
+            reader  = readers[0] if readers else None
+        if not reader and self._readers:
+            reader = next(iter(self._readers.values()))
 
-        for target in (source.get('target') or []):
-            if target.get('type') != 'door':
-                continue
-            door = self._door_by_id.get(target.get('id', ''))
-            if not door:
-                continue
-            if not reader:
-                readers = self._readers_by_door.get(door.address, [])
-                reader = readers[0] if readers else None
-            if reader:
-                reader.set_user(user_num)
-                reader.set_auth_method(method)
-                reader.set_granted(granted)
-                asyncio.create_task(
-                    self._reset_driver(reader, 'GV3' if granted else 'GV4'))
-            break  # one door per log event in practice
+        if reader:
+            reader.set_user(user_num)
+            reader.set_auth_method(method)
+            reader.set_granted(granted)
+            asyncio.create_task(
+                self._reset_driver(reader, 'GV3' if granted else 'GV4'))
 
     # ------------------------------------------------------------------
     # Helpers
