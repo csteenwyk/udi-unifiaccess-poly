@@ -43,7 +43,7 @@ In the **UniFi Access app** (not the main UniFi OS dashboard):
 
 1. Go to **Settings → Integrations → API Tokens**
 2. Create a new token
-3. Grant **View** on all categories and **People & Groups**, **Edit** on **Device** (required for unlock) and **Webhook** (required for doorbell)
+3. Grant **View** on all categories, **Edit** on **Device** (required for unlock) and **Webhook** (required for doorbell)
 4. Copy the token into the `api_token` custom parameter
 
 ### Doorbell setup
