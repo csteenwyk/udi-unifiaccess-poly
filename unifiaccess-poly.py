@@ -236,6 +236,12 @@ class AccessClient:
         self._session = aiohttp.ClientSession(
             cookie_jar=aiohttp.CookieJar(unsafe=True))
 
+    async def get_users(self) -> list:
+        resp = await self._session.get(
+            self._url(_API_BASE + '/users'), headers=self._headers(), ssl=self._ssl)
+        resp.raise_for_status()
+        return (await resp.json()).get('data') or []
+
     async def get_doors(self) -> list:
         resp = await self._session.get(
             self._url(_DOORS_URL), headers=self._headers(), ssl=self._ssl)
@@ -634,11 +640,20 @@ class Controller(udi_interface.Node):
     # ------------------------------------------------------------------
 
     async def _fetch_and_discover(self):
-        doors, devices = await asyncio.gather(
+        doors, devices, users = await asyncio.gather(
             self._client.get_doors(),
             self._client.get_devices(),
+            self._client.get_users(),
         )
-        LOGGER.info(f'Discovered {len(doors)} door(s), {len(devices)} device(s)')
+        LOGGER.info(f'Discovered {len(doors)} door(s), {len(devices)} device(s), {len(users)} user(s)')
+        for u in users:
+            uid  = u.get('id', '')
+            name = u.get('full_name') or u.get('first_name', '')
+            if uid and name:
+                self._users.get_or_add(uid, name)
+        if self._users.changed:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._save_and_rebuild_profile)
         self._discover(doors, devices)
 
     def _discover(self, doors: list, devices: list):
