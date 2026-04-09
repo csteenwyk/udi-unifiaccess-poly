@@ -18,6 +18,7 @@ import ssl
 import threading
 
 import aiohttp
+import aiohttp.web
 import udi_interface
 
 LOGGER = udi_interface.LOGGER
