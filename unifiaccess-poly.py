@@ -658,7 +658,9 @@ class Controller(udi_interface.Node):
         }
 
         for dev in devices:
-            if 'is_reader' not in dev.get('capabilities', []):
+            caps = dev.get('capabilities', [])
+            LOGGER.info(f"Device {dev.get('id')} caps={caps} alias={dev.get('alias')} name={dev.get('name')}")
+            if 'is_reader' not in caps and 'is_doorbell' not in caps:
                 continue
 
             loc = dev.get('location_id', '')
