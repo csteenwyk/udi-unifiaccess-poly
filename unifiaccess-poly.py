@@ -659,7 +659,6 @@ class Controller(udi_interface.Node):
 
         for dev in devices:
             caps = dev.get('capabilities', [])
-            LOGGER.info(f"Device {dev.get('id')} caps={caps} alias={dev.get('alias')} name={dev.get('name')}")
             if 'is_reader' not in caps and 'is_doorbell' not in caps:
                 continue
 
@@ -681,6 +680,13 @@ class Controller(udi_interface.Node):
 
             door_addr = door_id_to_addr.get(door_id, self.address)
             self._ensure_reader(dev, door_addr)
+
+        # Load any existing access_reader nodes from ISY into _readers so
+        # doorbell events can find them even if the device isn't in get_devices()
+        for address, node in self.poly.nodes.items():
+            if getattr(node, 'id', None) == 'access_reader' and address not in self._readers:
+                LOGGER.info(f'Loaded existing reader from ISY: {node.name} ({address})')
+                self._readers[address] = node
 
     def _ensure_door(self, door: dict):
         door_id = door.get('id', '')
@@ -779,12 +785,6 @@ class Controller(udi_interface.Node):
             if door:
                 readers = self._readers_by_door.get(door.address, [])
                 reader = readers[0] if readers else None
-                if not reader:
-                    # Device not in API (e.g. G6 Doorbell is a Protect camera) —
-                    # auto-create a reader node the first time it rings
-                    LOGGER.info(f'Auto-creating reader for doorbell dev={dev_id!r} door={door.name!r}')
-                    synthetic = {'id': dev_id, 'alias': f'{door.name} Doorbell', 'capabilities': ['is_doorbell']}
-                    reader = self._ensure_reader(synthetic, door.address)
         if not reader and self._readers:
             reader = next(iter(self._readers.values()))
         if reader:
