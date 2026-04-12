@@ -709,6 +709,14 @@ class Controller(udi_interface.Node):
         address = _make_address(dev_id)
         if address in self._readers:
             return self._readers[address]
+        # Reuse existing ISY node if it's already there (e.g. after restart)
+        existing = self.poly.nodes.get(address)
+        if existing:
+            LOGGER.info(f'Reusing existing reader node {address} ({existing.name})')
+            self._readers[address]      = existing
+            self._reader_by_dev[dev_id] = existing
+            self._readers_by_door.setdefault(door_address, []).append(existing)
+            return existing
         name = dev.get('alias') or dev.get('name') or dev_id
         # ISY only supports 2-level hierarchy; all nodes must be children of controller
         node = ReaderNode(self.poly, self.address, address, name, dev_id)
