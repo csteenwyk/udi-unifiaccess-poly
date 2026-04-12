@@ -771,6 +771,12 @@ class Controller(udi_interface.Node):
             if door:
                 readers = self._readers_by_door.get(door.address, [])
                 reader = readers[0] if readers else None
+                if not reader:
+                    # Device not in API (e.g. G6 Doorbell is a Protect camera) —
+                    # auto-create a reader node the first time it rings
+                    LOGGER.info(f'Auto-creating reader for doorbell dev={dev_id!r} door={door.name!r}')
+                    synthetic = {'id': dev_id, 'alias': f'{door.name} Doorbell', 'capabilities': ['is_doorbell']}
+                    reader = self._ensure_reader(synthetic, door.address)
         if not reader and self._readers:
             reader = next(iter(self._readers.values()))
         if reader:
