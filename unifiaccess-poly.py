@@ -681,12 +681,16 @@ class Controller(udi_interface.Node):
             door_addr = door_id_to_addr.get(door_id, self.address)
             self._ensure_reader(dev, door_addr)
 
-        # Load any existing access_reader nodes from ISY into _readers so
-        # doorbell events can find them even if the device isn't in get_devices()
-        for address, node in self.poly.getNodes().items():
-            if getattr(node, 'id', None) == 'access_reader' and address not in self._readers:
-                LOGGER.info(f'Loaded existing reader from ISY: {node.name} ({address})')
-                self._readers[address] = node
+        # For any door that has no reader (e.g. G6 doorbell is a Protect camera
+        # and never appears in get_devices()), create a synthetic doorbell reader
+        # node so doorbell ring events have somewhere to land.
+        for door_id, door_addr in door_id_to_addr.items():
+            if not self._readers_by_door.get(door_addr):
+                door_node = self._doors.get(door_addr)
+                door_name = door_node.name if door_node else door_addr
+                reader_addr = door_addr + 'r'  # e.g. 222d60e22d82r (13 chars)
+                self._ensure_synthetic_reader(door_addr, reader_addr,
+                                              f'{door_name} Doorbell')
 
     def _ensure_door(self, door: dict):
         door_id = door.get('id', '')
@@ -715,14 +719,6 @@ class Controller(udi_interface.Node):
         address = _make_address(dev_id)
         if address in self._readers:
             return self._readers[address]
-        # Reuse existing ISY node if it's already there (e.g. after restart)
-        existing = self.poly.getNodes().get(address)
-        if existing:
-            LOGGER.info(f'Reusing existing reader node {address} ({existing.name})')
-            self._readers[address]      = existing
-            self._reader_by_dev[dev_id] = existing
-            self._readers_by_door.setdefault(door_address, []).append(existing)
-            return existing
         name = dev.get('alias') or dev.get('name') or dev_id
         # ISY only supports 2-level hierarchy; all nodes must be children of controller
         node = ReaderNode(self.poly, self.address, address, name, dev_id)
@@ -731,6 +727,17 @@ class Controller(udi_interface.Node):
         self._reader_by_dev[dev_id] = node
         self._readers_by_door.setdefault(door_address, []).append(node)
         LOGGER.info(f'Added reader: {name} ({address}) under {door_address}')
+        return node
+
+    def _ensure_synthetic_reader(self, door_address: str, address: str, name: str):
+        """Create (or reuse) a doorbell reader node not tied to any Access device."""
+        if address in self._readers:
+            return self._readers[address]
+        node = ReaderNode(self.poly, self.address, address, name, '')
+        self._add_node_wait(node, timeout=3)
+        self._readers[address] = node
+        self._readers_by_door.setdefault(door_address, []).append(node)
+        LOGGER.info(f'Added synthetic doorbell reader: {name} ({address}) under {door_address}')
         return node
 
     # ------------------------------------------------------------------
