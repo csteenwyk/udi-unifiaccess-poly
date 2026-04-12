@@ -683,7 +683,7 @@ class Controller(udi_interface.Node):
 
         # Load any existing access_reader nodes from ISY into _readers so
         # doorbell events can find them even if the device isn't in get_devices()
-        for address, node in self.poly.nodes.items():
+        for address, node in self.poly.getNodes().items():
             if getattr(node, 'id', None) == 'access_reader' and address not in self._readers:
                 LOGGER.info(f'Loaded existing reader from ISY: {node.name} ({address})')
                 self._readers[address] = node
@@ -716,7 +716,7 @@ class Controller(udi_interface.Node):
         if address in self._readers:
             return self._readers[address]
         # Reuse existing ISY node if it's already there (e.g. after restart)
-        existing = self.poly.nodes.get(address)
+        existing = self.poly.getNodes().get(address)
         if existing:
             LOGGER.info(f'Reusing existing reader node {address} ({existing.name})')
             self._readers[address]      = existing
