@@ -28,9 +28,11 @@ LOGGER = udi_interface.LOGGER
 # ---------------------------------------------------------------------------
 
 _API_BASE    = '/api/v1/developer'
-_DOORS_URL   = _API_BASE + '/doors'
-_DEVICES_URL = _API_BASE + '/devices'
-_WS_URL      = _API_BASE + '/devices/notifications'
+_DOORS_URL      = _API_BASE + '/doors'
+_DEVICES_URL    = _API_BASE + '/devices'
+_WS_URL         = _API_BASE + '/devices/notifications'
+_GROUPS_URL     = _API_BASE + '/user_groups'
+_POLICIES_URL   = _API_BASE + '/access_policies'
 
 _EVT_LOCATION_UPDATE = 'access.data.device.location_update_v2'
 _EVT_V2_LOCATION     = 'access.data.v2.location.update'
@@ -57,6 +59,15 @@ _WEBHOOK_FILE  = os.path.join(_SCRIPT_DIR, 'webhook.json')
 
 _WEBHOOK_EVENTS = ['access.doorbell.incoming', 'access.doorbell.incoming.REN']
 _WEBHOOKS_URL   = _API_BASE + '/webhooks/endpoints'
+
+
+def _cmd_param(command, param_id, uom, default=0):
+    """Extract a named parameter from a multi-param ISY command."""
+    query = command.get('query', {})
+    key = f'{param_id}.uom{uom}'
+    if key in query:
+        return int(float(query[key]))
+    return int(command.get('value', default))
 
 
 def _make_address(raw_id: str) -> str:
@@ -137,6 +148,13 @@ class UserMap:
         LOGGER.info(f'Auto-learned user: {display_name} → {num}')
         return num
 
+    def get_uuid(self, num: int) -> str | None:
+        """Reverse lookup: NLS index → Access user UUID."""
+        for uid, n in self._uuid_to_num.items():
+            if n == num and not uid.startswith('__auto_'):
+                return uid
+        return None
+
     def nls_lines(self) -> list:
         return [f'AUTH_USER-{n} = {name}'
                 for n, name in sorted(self._num_to_name.items())]
@@ -177,6 +195,13 @@ ST-access_reader-GV4-NAME = Access Denied
 # Reader Commands
 CMD-access_reader-QUERY-NAME = Query
 
+# Controller Policy Commands
+CMD-access_controller-SET_GRP_POLICY-NAME = Set Group Policy
+CMD-access_controller-SET_USR_POLICY-NAME = Set User Policy
+CMDP-group-NAME = Group
+CMDP-user-NAME = User
+CMDP-policy-NAME = Policy
+
 # Auth Method values (GV2)
 AUTH_METHOD-0 = Unknown
 AUTH_METHOD-1 = NFC / Card
@@ -187,15 +212,70 @@ AUTH_METHOD-4 = Mobile
 # Users (GV1) - extended dynamically at runtime
 """
 
+_EDITORS_DIR = os.path.join(_SCRIPT_DIR, 'profile', 'editor')
 
-def write_nls(user_map: UserMap):
+
+def write_profile(user_map: UserMap, groups: list = None, policies: list = None):
+    """Write NLS and editors with dynamic user, group, and policy lists."""
+    groups = groups or []
+    policies = policies or []
+
+    # --- NLS ---
+    nls = _NLS_BASE
+    for line in user_map.nls_lines():
+        nls += line + '\n'
+
+    nls += '\n# Dynamic — User Groups\n'
+    if groups:
+        for i, g in enumerate(groups):
+            nls += f'CUST_GROUP-{i} = {g["name"]}\n'
+    else:
+        nls += 'CUST_GROUP-0 = (none)\n'
+
+    nls += '\n# Dynamic — Access Policies\n'
+    if policies:
+        for i, p in enumerate(policies):
+            nls += f'CUST_POLICY-{i} = {p["name"]}\n'
+    else:
+        nls += 'CUST_POLICY-0 = (none)\n'
+
     try:
         with open(_NLS_PATH, 'w') as f:
-            f.write(_NLS_BASE)
-            for line in user_map.nls_lines():
-                f.write(line + '\n')
+            f.write(nls)
     except Exception as e:
         LOGGER.error(f'Failed to write NLS: {e}')
+
+    # --- Editors ---
+    user_subset = ','.join(str(i) for i in range(max(user_map._next, 1)))
+    group_subset = ','.join(str(i) for i in range(max(len(groups), 1)))
+    policy_subset = ','.join(str(i) for i in range(max(len(policies), 1)))
+
+    editors = f"""<editors>
+  <editor id="E_STATUS">
+    <range uom="2" subset="0,1"/>
+  </editor>
+  <editor id="E_AUTH_USER">
+    <range uom="56" subset="{user_subset}" nls="AUTH_USER"/>
+  </editor>
+  <editor id="E_AUTH_METHOD">
+    <range uom="56" subset="0,1,2,3,4" nls="AUTH_METHOD"/>
+  </editor>
+  <editor id="E_GROUP">
+    <range uom="25" subset="{group_subset}" nls="CUST_GROUP"/>
+  </editor>
+  <editor id="E_POLICY">
+    <range uom="25" subset="{policy_subset}" nls="CUST_POLICY"/>
+  </editor>
+</editors>
+"""
+    try:
+        with open(os.path.join(_EDITORS_DIR, 'editors.xml'), 'w') as f:
+            f.write(editors)
+    except Exception as e:
+        LOGGER.error(f'Failed to write editors: {e}')
+
+    LOGGER.info(f'Profile updated: {user_map._next} user(s), '
+                f'{len(groups)} group(s), {len(policies)} policy(ies)')
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +329,32 @@ class AccessClient:
         resp = await self._session.put(
             self._url(f'{_DOORS_URL}/{door_id}/unlock'),
             headers=self._headers(), ssl=self._ssl)
+        resp.raise_for_status()
+
+    async def get_user_groups(self) -> list:
+        resp = await self._session.get(
+            self._url(_GROUPS_URL), headers=self._headers(), ssl=self._ssl)
+        resp.raise_for_status()
+        return (await resp.json()).get('data') or []
+
+    async def get_access_policies(self) -> list:
+        resp = await self._session.get(
+            self._url(_POLICIES_URL), headers=self._headers(), ssl=self._ssl)
+        resp.raise_for_status()
+        return (await resp.json()).get('data') or []
+
+    async def set_group_policies(self, group_id: str, policy_ids: list):
+        resp = await self._session.put(
+            self._url(f'{_GROUPS_URL}/{group_id}/access_policies'),
+            headers=self._headers(), ssl=self._ssl,
+            json={'access_policy_ids': policy_ids})
+        resp.raise_for_status()
+
+    async def set_user_policies(self, user_id: str, policy_ids: list):
+        resp = await self._session.put(
+            self._url(f'{_API_BASE}/users/{user_id}/access_policies'),
+            headers=self._headers(), ssl=self._ssl,
+            json={'access_policy_ids': policy_ids})
         resp.raise_for_status()
 
     async def listen(self, on_message):
@@ -476,6 +582,8 @@ class Controller(udi_interface.Node):
         self._readers           = {}   # address     → ReaderNode
         self._reader_by_dev     = {}   # device_id   → ReaderNode
         self._readers_by_door   = {}   # door_addr   → [ReaderNode]
+        self._groups            = []   # [{id, name}, ...]
+        self._policies          = []   # [{id, name}, ...]
         self._initialized       = False
         self._controller_added  = False
         self._node_added        = threading.Event()
@@ -561,7 +669,7 @@ class Controller(udi_interface.Node):
             return
 
         self._users.load()
-        write_nls(self._users)
+        write_profile(self._users)
         self._users.save()
         try:
             self.poly.updateProfile()
@@ -625,18 +733,31 @@ class Controller(udi_interface.Node):
     # ------------------------------------------------------------------
 
     async def _fetch_and_discover(self):
-        doors, devices, users = await asyncio.gather(
+        doors, devices, users, groups, policies = await asyncio.gather(
             self._client.get_doors(),
             self._client.get_devices(),
             self._client.get_users(),
+            self._client.get_user_groups(),
+            self._client.get_access_policies(),
         )
-        LOGGER.info(f'Discovered {len(doors)} door(s), {len(devices)} device(s), {len(users)} user(s)')
+        LOGGER.info(f'Discovered {len(doors)} door(s), {len(devices)} device(s), '
+                    f'{len(users)} user(s), {len(groups)} group(s), {len(policies)} policy(ies)')
         for u in users:
             uid  = u.get('id', '')
             name = u.get('full_name') or u.get('first_name', '')
             if uid and name:
                 self._users.get_or_add(uid, name)
-        if self._users.changed:
+
+        # Rebuild profile if users changed or group/policy lists changed
+        old_groups = len(self._groups)
+        old_policies = len(self._policies)
+        self._groups = [{'id': g['id'], 'name': g.get('name', g['id'])}
+                        for g in groups if g.get('id')]
+        self._policies = [{'id': p['id'], 'name': p.get('name', p['id'])}
+                          for p in policies if p.get('id')]
+        if (self._users.changed
+                or len(self._groups) != old_groups
+                or len(self._policies) != old_policies):
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._save_and_rebuild_profile)
         self._discover(doors, devices)
@@ -882,10 +1003,9 @@ class Controller(udi_interface.Node):
 
     def _save_and_rebuild_profile(self):
         self._users.save()
-        write_nls(self._users)
+        write_profile(self._users, self._groups, self._policies)
         try:
             self.poly.updateProfile()
-            LOGGER.info('Profile updated')
         except Exception as e:
             LOGGER.warning(f'updateProfile failed: {e}')
 
@@ -930,7 +1050,57 @@ class Controller(udi_interface.Node):
         elif self._client:
             self._async.submit(self._fetch_and_discover())
 
-    commands = {'QUERY': query, 'DISCOVER': cmd_discover}
+    def cmd_set_grp_policy(self, command):
+        group_idx  = _cmd_param(command, 'group',  25)
+        policy_idx = _cmd_param(command, 'policy', 25)
+        if group_idx < 0 or group_idx >= len(self._groups):
+            LOGGER.warning(f'Invalid group index: {group_idx}')
+            return
+        if policy_idx < 0 or policy_idx >= len(self._policies):
+            LOGGER.warning(f'Invalid policy index: {policy_idx}')
+            return
+        group  = self._groups[group_idx]
+        policy = self._policies[policy_idx]
+        LOGGER.info(f'Setting group "{group["name"]}" → policy "{policy["name"]}"')
+        self._async.submit(
+            self._do_set_group_policy(group['id'], policy['id']))
+
+    async def _do_set_group_policy(self, group_id: str, policy_id: str):
+        try:
+            await self._client.set_group_policies(group_id, [policy_id])
+            LOGGER.info(f'Group policy set successfully')
+        except Exception as e:
+            LOGGER.error(f'Failed to set group policy: {e}')
+
+    def cmd_set_usr_policy(self, command):
+        user_idx   = _cmd_param(command, 'user',   56)
+        policy_idx = _cmd_param(command, 'policy', 25)
+        user_uuid = self._users.get_uuid(user_idx)
+        if not user_uuid:
+            LOGGER.warning(f'No UUID for user index {user_idx}')
+            return
+        if policy_idx < 0 or policy_idx >= len(self._policies):
+            LOGGER.warning(f'Invalid policy index: {policy_idx}')
+            return
+        policy = self._policies[policy_idx]
+        user_name = self._users._num_to_name.get(user_idx, user_idx)
+        LOGGER.info(f'Setting user "{user_name}" → policy "{policy["name"]}"')
+        self._async.submit(
+            self._do_set_user_policy(user_uuid, policy['id']))
+
+    async def _do_set_user_policy(self, user_id: str, policy_id: str):
+        try:
+            await self._client.set_user_policies(user_id, [policy_id])
+            LOGGER.info(f'User policy set successfully')
+        except Exception as e:
+            LOGGER.error(f'Failed to set user policy: {e}')
+
+    commands = {
+        'QUERY':          query,
+        'DISCOVER':       cmd_discover,
+        'SET_GRP_POLICY': cmd_set_grp_policy,
+        'SET_USR_POLICY': cmd_set_usr_policy,
+    }
 
 
 # ---------------------------------------------------------------------------

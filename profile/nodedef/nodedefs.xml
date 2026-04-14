@@ -10,6 +10,14 @@
       <accepts>
         <cmd id="QUERY"/>
         <cmd id="DISCOVER"/>
+        <cmd id="SET_GRP_POLICY">
+          <p id="group" editor="E_GROUP"/>
+          <p id="policy" editor="E_POLICY"/>
+        </cmd>
+        <cmd id="SET_USR_POLICY">
+          <p id="user" editor="E_AUTH_USER"/>
+          <p id="policy" editor="E_POLICY"/>
+        </cmd>
       </accepts>
     </cmds>
   </nodeDef>
