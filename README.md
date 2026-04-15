@@ -36,6 +36,7 @@ Set the following in Custom Parameters:
 | `verify_ssl` | Verify SSL certificate | `false` |
 | `webhook_host` | eisy IP address (for doorbell webhook receiver) | |
 | `webhook_port` | Port for the webhook HTTP server | `7777` |
+| `reader_1` … `reader_5` | Protect doorbell device ID and name (see below) | |
 
 ### Creating an API token
 
@@ -61,6 +62,30 @@ The webhook is registered automatically and cleaned up when the plugin stops. Yo
 curl -sk -H "Authorization: Bearer <token>" https://<host>:12445/api/v1/developer/webhooks/endpoints
 ```
 
+### Protect doorbell readers (G6, etc.)
+
+UniFi Protect doorbells (like the G6 Entry) are Protect cameras, not Access readers — they never appear in the Access device list. To get a separate ISY node per doorbell, configure `reader_N` params:
+
+```
+reader_1 = 69d7222400e0d503e4009952:Front Door
+reader_2 = 69dea08000642003e404ea0b:Garage Door
+```
+
+Format: `device_id:Display Name`
+
+**How to find the device ID:**
+
+1. Open your UniFi Protect web UI
+2. Click on the doorbell camera
+3. The camera ID is in the browser URL (the long hex string after `/cameras/`)
+
+Alternatively, ring the doorbell once without any `reader_N` configured — the plugin auto-creates a node and logs the device ID:
+```
+Auto-creating reader for new doorbell dev=69d7222400e0d5...
+```
+
+Each configured reader gets its own ISY node with doorbell ring, last user, auth method, and access granted/denied drivers. If an unknown doorbell rings that isn't in the config, a node is auto-created and persisted for future restarts.
+
 ### User identification
 
 All users are loaded automatically from the Access API when the plugin starts. Their names appear immediately in the ISY `Last User` dropdown without needing to authenticate first. New users added to Access will be picked up on the next plugin restart.
@@ -69,11 +94,20 @@ All users are loaded automatically from the Access API when the plugin starts. T
 
 ```
 UniFi Access Controller
-└── Front Door  (door node)
-└── Front Door Reader  (reader sub-node, child of controller)
+├── Exterior Doors        (door node)
+├── Front Door            (reader node — from reader_1 config)
+└── Garage Door           (reader node — from reader_2 config)
 ```
 
 Note: ISY supports only two levels of hierarchy, so reader nodes are children of the controller rather than the door.
+
+### Controller Node Commands
+
+| Command | Description |
+|---------|-------------|
+| Re-Discover | Re-query doors, devices, users, groups, and policies |
+| Set Group Policy | Assign an access policy to a user group (by name) |
+| Set User Policy | Assign an access policy to an individual user (by name) |
 
 ### Door Node Drivers
 
@@ -128,6 +162,15 @@ If
    Control 'Front Door Reader' / Doorbell Ring turns On
 Then
    Send Notification 'Someone at the door'
+```
+
+Switch access policy for vacation mode:
+
+```
+If
+   $Vacation_Mode is True
+Then
+   Set 'UniFi Access' Group = Family, Policy = Vacation
 ```
 
 ## Firewall
