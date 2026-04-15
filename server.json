@@ -14,7 +14,12 @@
         "api_token": "",
         "verify_ssl": "false",
         "webhook_host": "",
-        "webhook_port": "7777"
+        "webhook_port": "7777",
+        "reader_1": "",
+        "reader_2": "",
+        "reader_3": "",
+        "reader_4": "",
+        "reader_5": ""
     },
     "credits": [
         {

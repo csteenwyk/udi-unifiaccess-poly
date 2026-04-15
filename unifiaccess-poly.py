@@ -55,7 +55,8 @@ _AUTH_METHOD_MAP = {
 _SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 _NLS_PATH      = os.path.join(_SCRIPT_DIR, 'profile', 'nls', 'en_us.txt')
 _USER_MAP_FILE = os.path.join(_SCRIPT_DIR, 'usermap.json')
-_WEBHOOK_FILE  = os.path.join(_SCRIPT_DIR, 'webhook.json')
+_WEBHOOK_FILE    = os.path.join(_SCRIPT_DIR, 'webhook.json')
+_DOORBELLS_FILE  = os.path.join(_SCRIPT_DIR, 'doorbells.json')
 
 _WEBHOOK_EVENTS = ['access.doorbell.incoming', 'access.doorbell.incoming.REN']
 _WEBHOOKS_URL   = _API_BASE + '/webhooks/endpoints'
@@ -68,6 +69,19 @@ def _cmd_param(command, param_id, uom, default=0):
     if key in query:
         return int(float(query[key]))
     return int(command.get('value', default))
+
+
+def _parse_reader_params(params: dict) -> list:
+    """Parse reader_N = device_id:Name entries from custom params."""
+    readers = []
+    for key, val in params.items():
+        if not key.startswith('reader_') or not val:
+            continue
+        val = val.strip()
+        if ':' in val:
+            dev_id, name = val.split(':', 1)
+            readers.append({'dev_id': dev_id.strip(), 'name': name.strip()})
+    return readers
 
 
 def _make_address(raw_id: str) -> str:
@@ -802,16 +816,19 @@ class Controller(udi_interface.Node):
             door_addr = door_id_to_addr.get(door_id, self.address)
             self._ensure_reader(dev, door_addr)
 
-        # For any door that has no reader (e.g. G6 doorbell is a Protect camera
-        # and never appears in get_devices()), create a synthetic doorbell reader
-        # node so doorbell ring events have somewhere to land.
-        for door_id, door_addr in door_id_to_addr.items():
-            if not self._readers_by_door.get(door_addr):
-                door_node = self._doors.get(door_addr)
-                door_name = door_node.name if door_node else door_addr
-                reader_addr = door_addr + 'r'  # e.g. 222d60e22d82r (13 chars)
-                self._ensure_synthetic_reader(door_addr, reader_addr,
-                                              f'{door_name} Doorbell')
+        # Create reader nodes for configured reader_N params (Protect doorbells
+        # that don't appear in get_devices()). Fall back to loading any
+        # auto-created doorbells from doorbells.json.
+        configured_readers = _parse_reader_params(dict(self._params))
+        for cr in configured_readers:
+            dev_id = cr['dev_id']
+            if dev_id not in self._reader_by_dev:
+                # Associate with first door if only one exists
+                door_addr = next(iter(door_id_to_addr.values()), self.address)
+                self._ensure_configured_reader(dev_id, cr['name'], door_addr)
+
+        # Load auto-created doorbells from persistence
+        self._load_persisted_doorbells(door_id_to_addr)
 
     def _ensure_door(self, door: dict):
         door_id = door.get('id', '')
@@ -850,16 +867,64 @@ class Controller(udi_interface.Node):
         LOGGER.info(f'Added reader: {name} ({address}) under {door_address}')
         return node
 
-    def _ensure_synthetic_reader(self, door_address: str, address: str, name: str):
-        """Create (or reuse) a doorbell reader node not tied to any Access device."""
+    def _ensure_configured_reader(self, dev_id: str, name: str, door_address: str):
+        """Create (or reuse) a reader node for a configured Protect doorbell."""
+        address = _make_address(dev_id)
         if address in self._readers:
             return self._readers[address]
-        node = ReaderNode(self.poly, self.address, address, name, '')
+        node = ReaderNode(self.poly, self.address, address, name, dev_id)
         self._add_node_wait(node, timeout=3)
         self._readers[address] = node
+        self._reader_by_dev[dev_id] = node
         self._readers_by_door.setdefault(door_address, []).append(node)
-        LOGGER.info(f'Added synthetic doorbell reader: {name} ({address}) under {door_address}')
+        LOGGER.info(f'Added configured reader: {name} ({address}) dev={dev_id[:12]}...')
         return node
+
+    def _auto_create_reader(self, dev_id: str, door_id: str):
+        """Auto-create a reader on first ring from an unknown device. Persist for restarts."""
+        door = self._door_by_id.get(door_id)
+        door_addr = door.address if door else self.address
+        door_name = door.name if door else 'Unknown'
+        # Count existing readers on this door for numbering
+        existing = len(self._readers_by_door.get(door_addr, []))
+        suffix = f' {existing + 1}' if existing > 0 else ''
+        name = f'{door_name} Doorbell{suffix}'
+        node = self._ensure_configured_reader(dev_id, name, door_addr)
+        # Persist for future restarts
+        self._save_doorbell(dev_id, name, door_id)
+        return node
+
+    def _save_doorbell(self, dev_id: str, name: str, door_id: str):
+        """Append a doorbell entry to doorbells.json."""
+        try:
+            try:
+                with open(_DOORBELLS_FILE) as f:
+                    data = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                data = {}
+            data[dev_id] = {'name': name, 'door_id': door_id}
+            with open(_DOORBELLS_FILE, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            LOGGER.warning(f'Failed to save doorbell: {e}')
+
+    def _load_persisted_doorbells(self, door_id_to_addr: dict):
+        """Load auto-created doorbells from doorbells.json."""
+        try:
+            with open(_DOORBELLS_FILE) as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return
+        except Exception as e:
+            LOGGER.warning(f'Failed to load doorbells: {e}')
+            return
+        for dev_id, info in data.items():
+            if dev_id in self._reader_by_dev:
+                continue  # already created from config
+            door_id = info.get('door_id', '')
+            door_addr = door_id_to_addr.get(door_id, self.address)
+            name = info.get('name', dev_id)
+            self._ensure_configured_reader(dev_id, name, door_addr)
 
     # ------------------------------------------------------------------
     # WebSocket event handling  (async — no blocking I/O on this thread)
@@ -908,6 +973,10 @@ class Controller(udi_interface.Node):
 
     def _ring_doorbell(self, dev_id: str, door_id: str):
         reader = self._reader_by_dev.get(dev_id)
+        if not reader and dev_id:
+            # Unknown device — auto-create a reader node for it
+            LOGGER.info(f'Auto-creating reader for new doorbell dev={dev_id[:12]}...')
+            reader = self._auto_create_reader(dev_id, door_id or '')
         if not reader and door_id:
             door = self._door_by_id.get(door_id)
             if door:
