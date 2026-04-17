@@ -72,15 +72,17 @@ def _cmd_param(command, param_id, uom, default=0):
 
 
 def _parse_reader_params(params: dict) -> list:
-    """Parse reader_N = device_id:Name entries from custom params."""
+    """Parse reader_N = device_id:Name[:entry|exit] entries from custom params."""
     readers = []
     for key, val in params.items():
         if not key.startswith('reader_') or not val:
             continue
-        val = val.strip()
-        if ':' in val:
-            dev_id, name = val.split(':', 1)
-            readers.append({'dev_id': dev_id.strip(), 'name': name.strip()})
+        parts = [p.strip() for p in val.strip().split(':')]
+        if len(parts) >= 2:
+            entry = {'dev_id': parts[0], 'name': parts[1]}
+            if len(parts) >= 3 and parts[2].lower() in ('entry', 'exit'):
+                entry['entry_exit'] = parts[2].lower()
+            readers.append(entry)
     return readers
 
 
@@ -596,6 +598,7 @@ class Controller(udi_interface.Node):
         self._readers           = {}   # address     → ReaderNode
         self._reader_by_dev     = {}   # device_id   → ReaderNode
         self._readers_by_door   = {}   # door_addr   → [ReaderNode]
+        self._reader_by_entry   = {}   # (door_addr, 'entry'|'exit') → ReaderNode
         self._groups            = []   # [{id, name}, ...]
         self._policies          = []   # [{id, name}, ...]
         self._initialized       = False
@@ -823,9 +826,9 @@ class Controller(udi_interface.Node):
         for cr in configured_readers:
             dev_id = cr['dev_id']
             if dev_id not in self._reader_by_dev:
-                # Associate with first door if only one exists
                 door_addr = next(iter(door_id_to_addr.values()), self.address)
-                self._ensure_configured_reader(dev_id, cr['name'], door_addr)
+                self._ensure_configured_reader(dev_id, cr['name'], door_addr,
+                                               cr.get('entry_exit', ''))
 
         # Load auto-created doorbells from persistence
         self._load_persisted_doorbells(door_id_to_addr)
@@ -867,7 +870,8 @@ class Controller(udi_interface.Node):
         LOGGER.info(f'Added reader: {name} ({address}) under {door_address}')
         return node
 
-    def _ensure_configured_reader(self, dev_id: str, name: str, door_address: str):
+    def _ensure_configured_reader(self, dev_id: str, name: str, door_address: str,
+                                   entry_exit: str = ''):
         """Create (or reuse) a reader node for a configured Protect doorbell."""
         address = _make_address(dev_id)
         if address in self._readers:
@@ -877,7 +881,9 @@ class Controller(udi_interface.Node):
         self._readers[address] = node
         self._reader_by_dev[dev_id] = node
         self._readers_by_door.setdefault(door_address, []).append(node)
-        LOGGER.info(f'Added configured reader: {name} ({address}) dev={dev_id[:12]}...')
+        if entry_exit:
+            self._reader_by_entry[(door_address, entry_exit)] = node
+        LOGGER.info(f'Added configured reader: {name} ({address}) dev={dev_id[:12]}... {entry_exit or ""}')
         return node
 
     def _auto_create_reader(self, dev_id: str, door_id: str):
@@ -1011,13 +1017,23 @@ class Controller(udi_interface.Node):
         status = 'GRANTED' if granted else 'DENIED'
         LOGGER.info(f'Access {status}: {name or uid} via {method or "?"} (user={user_num})')
 
-        # Device in metadata is the hub, not the reader — look up by door instead
+        # Route auth event to the correct reader by entry/exit if configured
         door_id = (metadata.get('door') or {}).get('id', '')
         door    = self._door_by_id.get(door_id)
         reader  = None
         if door:
-            readers = self._readers_by_door.get(door.address, [])
-            reader  = readers[0] if readers else None
+            # Check target for door_entry_method to distinguish entry vs exit
+            targets = metadata.get('target') or data.get('target') or []
+            entry_method = ''
+            for t in targets:
+                if t.get('type') == 'device_config' and t.get('id') == 'door_entry_method':
+                    entry_method = (t.get('display_name') or '').lower()
+                    break
+            if entry_method:
+                reader = self._reader_by_entry.get((door.address, entry_method))
+            if not reader:
+                readers = self._readers_by_door.get(door.address, [])
+                reader = readers[0] if readers else None
         if not reader and self._readers:
             reader = next(iter(self._readers.values()))
 
