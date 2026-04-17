@@ -1024,7 +1024,8 @@ class Controller(udi_interface.Node):
         if door:
             # Check target for door_entry_method to distinguish entry vs exit
             targets = metadata.get('target') or data.get('target') or []
-            LOGGER.info(f'Auth event keys: {sorted(data.keys())} metadata keys: {sorted(metadata.keys())}')
+            dev_cfg = metadata.get('device_config') or {}
+            LOGGER.info(f'Auth device_config: {dev_cfg}')
             entry_method = ''
             for t in targets:
                 if t.get('type') == 'device_config' and t.get('id') == 'door_entry_method':
