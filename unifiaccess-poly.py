@@ -1024,11 +1024,9 @@ class Controller(udi_interface.Node):
         if door:
             # Check target for door_entry_method to distinguish entry vs exit
             targets = metadata.get('target') or data.get('target') or []
+            LOGGER.info(f'Auth event full metadata: {json.dumps(metadata, default=str)}')
             dev_cfg = metadata.get('device_config') or {}
             entry_method = (dev_cfg.get('display_name') or '').lower()
-            cam = metadata.get('camera') or {}
-            dev = metadata.get('device') or {}
-            LOGGER.info(f'Auth routing: entry_method={entry_method} camera={cam} device={dev}')
             if entry_method:
                 reader = self._reader_by_entry.get((door.address, entry_method))
             if not reader:
