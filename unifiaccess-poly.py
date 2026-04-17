@@ -1026,6 +1026,9 @@ class Controller(udi_interface.Node):
             targets = metadata.get('target') or data.get('target') or []
             dev_cfg = metadata.get('device_config') or {}
             entry_method = (dev_cfg.get('display_name') or '').lower()
+            cam = metadata.get('camera') or {}
+            dev = metadata.get('device') or {}
+            LOGGER.info(f'Auth routing: entry_method={entry_method} camera={cam} device={dev}')
             if entry_method:
                 reader = self._reader_by_entry.get((door.address, entry_method))
             if not reader:
