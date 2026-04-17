@@ -18,6 +18,18 @@
           <p id="user" editor="E_AUTH_USER"/>
           <p id="policy" editor="E_POLICY"/>
         </cmd>
+        <cmd id="SET_TOUCH_PASS">
+          <p id="" editor="E_STATUS"/>
+        </cmd>
+        <cmd id="SET_NFC">
+          <p id="" editor="E_STATUS"/>
+        </cmd>
+        <cmd id="SET_MOBILE">
+          <p id="" editor="E_STATUS"/>
+        </cmd>
+        <cmd id="SET_FACE">
+          <p id="" editor="E_STATUS"/>
+        </cmd>
       </accepts>
     </cmds>
   </nodeDef>

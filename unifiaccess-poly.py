@@ -214,6 +214,10 @@ CMD-access_reader-QUERY-NAME = Query
 # Controller Policy Commands
 CMD-access_controller-SET_GRP_POLICY-NAME = Set Group Policy
 CMD-access_controller-SET_USR_POLICY-NAME = Set User Policy
+CMD-access_controller-SET_TOUCH_PASS-NAME = Set Touch Pass
+CMD-access_controller-SET_NFC-NAME = Set NFC
+CMD-access_controller-SET_MOBILE-NAME = Set Mobile Unlock
+CMD-access_controller-SET_FACE-NAME = Set Face Unlock
 CMDP-group-NAME = Group
 CMDP-user-NAME = User
 CMDP-policy-NAME = Policy
@@ -371,6 +375,14 @@ class AccessClient:
             self._url(f'{_API_BASE}/users/{user_id}/access_policies'),
             headers=self._headers(), ssl=self._ssl,
             json={'access_policy_ids': policy_ids})
+        resp.raise_for_status()
+
+    async def set_access_method(self, device_id: str, method: str, enabled: bool):
+        payload = {'access_methods': {method: {'enabled': 'true' if enabled else 'false'}}}
+        resp = await self._session.put(
+            self._url(f'{_DEVICES_URL}/{device_id}/settings'),
+            headers={**self._headers(), 'Content-Type': 'application/json'},
+            ssl=self._ssl, json=payload)
         resp.raise_for_status()
 
     async def listen(self, on_message):
@@ -601,6 +613,7 @@ class Controller(udi_interface.Node):
         self._reader_by_entry   = {}   # (door_addr, 'entry'|'exit') → ReaderNode
         self._groups            = []   # [{id, name}, ...]
         self._policies          = []   # [{id, name}, ...]
+        self._hub_device_id     = None # Access hub device ID for settings API
         self._initialized       = False
         self._controller_added  = False
         self._node_added        = threading.Event()
@@ -788,12 +801,12 @@ class Controller(udi_interface.Node):
 
         # Build hub→door map: hub's location_id == door_id
         device_by_id = {d['id']: d for d in devices}
-        hub_to_door  = {
-            dev['id']: dev['location_id']
-            for dev in devices
-            if 'is_hub' in dev.get('capabilities', [])
-            and dev.get('location_id') in door_id_to_addr
-        }
+        hub_to_door  = {}
+        for dev in devices:
+            if 'is_hub' in dev.get('capabilities', []):
+                self._hub_device_id = dev['id']
+                if dev.get('location_id') in door_id_to_addr:
+                    hub_to_door[dev['id']] = dev['location_id']
 
         for dev in devices:
             caps = dev.get('capabilities', [])
@@ -1183,11 +1196,44 @@ class Controller(udi_interface.Node):
         except Exception as e:
             LOGGER.error(f'Failed to set user policy: {e}')
 
+    def _cmd_toggle_method(self, method: str, command):
+        if not self._hub_device_id:
+            LOGGER.warning('No hub device found — cannot change access method')
+            return
+        enabled = bool(int(command.get('value', 0)))
+        label = 'enabled' if enabled else 'disabled'
+        LOGGER.info(f'Setting {method} → {label} on hub {self._hub_device_id}')
+        self._async.submit(
+            self._do_set_access_method(method, enabled))
+
+    async def _do_set_access_method(self, method: str, enabled: bool):
+        try:
+            await self._client.set_access_method(self._hub_device_id, method, enabled)
+            LOGGER.info(f'Access method {method} updated successfully')
+        except Exception as e:
+            LOGGER.error(f'Failed to set access method {method}: {e}')
+
+    def cmd_set_touch_pass(self, command):
+        self._cmd_toggle_method('touch_pass', command)
+
+    def cmd_set_nfc(self, command):
+        self._cmd_toggle_method('nfc', command)
+
+    def cmd_set_mobile(self, command):
+        self._cmd_toggle_method('bt_button', command)
+
+    def cmd_set_face(self, command):
+        self._cmd_toggle_method('face', command)
+
     commands = {
         'QUERY':          query,
         'DISCOVER':       cmd_discover,
         'SET_GRP_POLICY': cmd_set_grp_policy,
         'SET_USR_POLICY': cmd_set_usr_policy,
+        'SET_TOUCH_PASS': cmd_set_touch_pass,
+        'SET_NFC':        cmd_set_nfc,
+        'SET_MOBILE':     cmd_set_mobile,
+        'SET_FACE':       cmd_set_face,
     }
 
 
