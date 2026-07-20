@@ -702,10 +702,16 @@ class Controller(udi_interface.Node):
     def _on_node_added(self, data):
         addr = (data or {}).get('address')
         with self._node_events_lock:
-            ev = self._node_events.get(addr)
-            # Older payloads may omit the address; fall back to waking everyone
-            # rather than hanging every waiter until timeout.
-            waiters = [ev] if ev else list(self._node_events.values())
+            if addr is None:
+                # Payload without an address: we can't tell who it was for,
+                # so wake everyone rather than hang every waiter.
+                waiters = list(self._node_events.values())
+            else:
+                # A known address with no waiter means a late or duplicate ack.
+                # Waking someone else here is exactly the cross-wake this
+                # per-address scheme exists to prevent.
+                ev = self._node_events.get(addr)
+                waiters = [ev] if ev else []
         for e in waiters:
             e.set()
 
