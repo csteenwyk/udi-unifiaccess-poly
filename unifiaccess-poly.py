@@ -16,6 +16,7 @@ import json
 import os
 import ssl
 import threading
+import time
 
 import aiohttp
 import aiohttp.web
@@ -44,6 +45,17 @@ _LOCATION_EVENTS = {_EVT_LOCATION_UPDATE, _EVT_V2_LOCATION,
                     'access.data.location.update'}
 
 _MAX_USERS = 30
+
+# Self-healing: minutes of sustained connection failure before the plugin
+# restarts itself, and how long to wait before it's allowed to do so again
+# (so a genuinely-down controller doesn't cause a reboot loop).
+_WATCHDOG_DEFAULT_MIN = 5
+_RESTART_COOLDOWN_SEC = 1800
+# Don't raise a user-visible notice for brief blips — only sustained outages.
+_NOTICE_AFTER_SEC = 60
+# A single press can arrive over both the WebSocket and the webhook; collapse them.
+_RING_DEDUP_SEC = 2.0
+_WEBHOOK_NAME = 'udi-unifiaccess-poly'
 
 _AUTH_METHOD_MAP = {
     'nfc': 1, 'card': 1, 'rfid': 1,
@@ -317,8 +329,15 @@ class AccessClient:
         return {'Authorization': f'Bearer {self.api_token}'}
 
     async def connect(self):
+        # Bound connection ESTABLISHMENT only. A blackholed route (no ICMP
+        # unreachable — what a lost route actually looks like) hangs the TCP
+        # connect, which is the case we care about.
+        # Deliberately no `total`: this session is also used for ws_connect,
+        # and a total timeout applies to the whole upgraded connection, which
+        # would tear down a healthy WebSocket on a timer.
         self._session = aiohttp.ClientSession(
-            cookie_jar=aiohttp.CookieJar(unsafe=True))
+            cookie_jar=aiohttp.CookieJar(unsafe=True),
+            timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10))
 
     async def get_users(self) -> list:
         resp = await self._session.get(
@@ -373,10 +392,14 @@ class AccessClient:
             json={'access_policy_ids': policy_ids})
         resp.raise_for_status()
 
-    async def listen(self, on_message):
+    async def listen(self, on_message, on_connect=None):
         async with self._session.ws_connect(
                 self._ws_url(), headers=self._headers(),
                 ssl=self._ssl, heartbeat=30) as ws:
+            # Fires only once the socket is genuinely established — this is the
+            # only trustworthy "we are online" signal.
+            if on_connect:
+                on_connect()
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     try:
@@ -458,8 +481,20 @@ class _AsyncBridge:
             LOGGER.error(f'Async error: {e}')
             return None
 
-    def submit(self, coro):
-        asyncio.run_coroutine_threadsafe(coro, self._loop)
+    def submit(self, coro, label='task'):
+        """Fire-and-forget, but never silently: failures are logged."""
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        future.add_done_callback(lambda f: self._log_failure(f, label))
+        return future
+
+    @staticmethod
+    def _log_failure(future, label):
+        try:
+            future.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            LOGGER.error(f'Async {label} failed: {e}', exc_info=True)
 
     def shutdown(self):
         self._loop.call_soon_threadsafe(self._loop.stop)
@@ -603,13 +638,23 @@ class Controller(udi_interface.Node):
         self._policies          = []   # [{id, name}, ...]
         self._initialized       = False
         self._controller_added  = False
-        self._node_added        = threading.Event()
+        self._node_events       = {}   # node address → threading.Event
+        self._node_events_lock  = threading.Lock()
         self._params            = udi_interface.Custom(polyglot, 'customparams')
+        self._data              = udi_interface.Custom(polyglot, 'customdata')
         self._users             = UserMap()
+        self._down_since        = None  # epoch of first failure in current outage
+        self._watchdog_minutes  = _WATCHDOG_DEFAULT_MIN
+        self._running           = True
+        self._connect_lock      = threading.Lock()
+        self._profile_written   = False
+        self._webhook_started   = False
+        self._last_ring         = {}   # dev_id → epoch of last ring
 
         polyglot.subscribe(polyglot.CONFIGDONE,   self._on_config_done)
         polyglot.subscribe(polyglot.START,        self.start)
         polyglot.subscribe(polyglot.CUSTOMPARAMS, self.param_handler)
+        polyglot.subscribe(polyglot.CUSTOMDATA,   self._customdata_handler)
         polyglot.subscribe(polyglot.POLL,         self.poll)
         polyglot.subscribe(polyglot.STOP,         self.stop)
         polyglot.subscribe(polyglot.ADDNODEDONE,  self._on_node_added)
@@ -624,8 +669,14 @@ class Controller(udi_interface.Node):
     def start(self):
         LOGGER.debug('start()')
 
+    def _customdata_handler(self, data):
+        """Custom() does not self-load — without this the watchdog's restart
+        cooldown would read None every start and could reboot-loop."""
+        self._data.load(data or {})
+
     def stop(self):
         LOGGER.info('Stopping UniFi Access nodeserver')
+        self._running = False
         if self._client and self._webhook_id:
             self._async.run(self._client.delete_webhook(self._webhook_id), timeout=10)
         if self._webhook_server:
@@ -640,38 +691,86 @@ class Controller(udi_interface.Node):
         try:
             self._add_node_wait(self, timeout=3)
             self._controller_added = True
-            self.setDriver('ST', 1)
+            # ST reflects the UniFi connection, not node creation. Claiming 1
+            # here made the controller look healthy for an entire outage.
+            self.setDriver('ST', 0)
             if not self._initialized:
                 self._try_connect()
         except Exception as e:
             LOGGER.error(f'Failed to add controller node: {e}', exc_info=True)
 
     def _on_node_added(self, data):
-        self._node_added.set()
+        addr = (data or {}).get('address')
+        with self._node_events_lock:
+            ev = self._node_events.get(addr)
+            # Older payloads may omit the address; fall back to waking everyone
+            # rather than hanging every waiter until timeout.
+            waiters = [ev] if ev else list(self._node_events.values())
+        for e in waiters:
+            e.set()
 
     def _add_node_wait(self, node, timeout=15):
-        self._node_added.clear()
-        self.poly.addNode(node)
-        self._node_added.wait(timeout=timeout)
+        # One Event per address: a single shared Event let concurrent callers
+        # consume each other's completion and return before their node existed.
+        ev = threading.Event()
+        with self._node_events_lock:
+            self._node_events[node.address] = ev
+        try:
+            self.poly.addNode(node)
+            if not ev.wait(timeout=timeout):
+                LOGGER.warning(f'Timed out waiting for ISY to add {node.address}')
+        finally:
+            with self._node_events_lock:
+                self._node_events.pop(node.address, None)
 
     # ------------------------------------------------------------------
     # Params / connection
     # ------------------------------------------------------------------
 
     def param_handler(self, params):
+        # PG3 always publishes CUSTOMPARAMS at startup, but with a None payload
+        # when it has nothing stored. Loading that would wipe _rawdata, and
+        # params.get() would raise inside a bare handler thread — silently
+        # leaving the plugin configured-but-never-connected.
+        if not params:
+            LOGGER.warning('CUSTOMPARAMS with no data — keeping existing params')
+            return
         self._params.load(params)
-        self.poly.Notices.clear()
-        host      = params.get('host',      '').strip()
-        api_token = params.get('api_token', '').strip()
+        # Targeted delete, not clear() — clear() would also wipe an active
+        # outage notice every time params are saved.
+        self.poly.Notices.delete('config')
+        host      = (params.get('host')      or '').strip()
+        api_token = (params.get('api_token') or '').strip()
         if not host or not api_token:
             self.poly.Notices['config'] = 'Set host and api_token in Custom Parameters'
             return
         if not self._initialized:
             self._try_connect()
 
+    def _is_configured(self) -> bool:
+        if ((self._params.get('host') or '').strip()
+                and (self._params.get('api_token') or '').strip()):
+            return True
+        # _params can be empty if CUSTOMPARAMS never reached us. PG3's config is
+        # the authoritative copy, so fall back to it rather than staying dead.
+        try:
+            cfg = (self.poly.getConfig() or {}).get('customParams') or {}
+        except Exception:
+            return False
+        if (cfg.get('host') or '').strip() and (cfg.get('api_token') or '').strip():
+            LOGGER.warning('Recovered params from PG3 config')
+            self._params.load(cfg)
+            return True
+        return False
+
     def _try_connect(self):
-        # Set flag first to prevent double-connect if both callbacks fire
-        self._initialized = True
+        # CONFIGDONE, CUSTOMPARAMS and POLL each run on their own thread, so a
+        # bare check-then-set would let two supervisors start against two
+        # clients, leaking a session and orphaning a loop.
+        with self._connect_lock:
+            if self._initialized:
+                return
+            self._initialized = True
 
         params        = self._params
         host          = (params.get('host')         or '').strip()
@@ -680,70 +779,142 @@ class Controller(udi_interface.Node):
         verify        = (params.get('verify_ssl')   or 'false').strip().lower() == 'true'
         webhook_host  = (params.get('webhook_host') or '').strip()
         webhook_port  = int((params.get('webhook_port') or '7777').strip())
+        try:
+            self._watchdog_minutes = int(
+                (params.get('watchdog_minutes') or _WATCHDOG_DEFAULT_MIN))
+        except ValueError:
+            self._watchdog_minutes = _WATCHDOG_DEFAULT_MIN
 
         if not host or not api_token:
+            LOGGER.warning('host/api_token not set — not connecting')
             self._initialized = False
             return
 
-        self._users.load()
-        write_profile(self._users)
-        self._users.save()
-        try:
-            self.poly.updateProfile()
-            LOGGER.info('Profile uploaded to ISY')
-        except Exception as e:
-            LOGGER.warning(f'updateProfile failed: {e}')
+        # Profile work is expensive and only needs doing once per process;
+        # a retry loop must not re-upload the ISY profile on every attempt.
+        if not self._profile_written:
+            self._users.load()
+            write_profile(self._users)
+            self._users.save()
+            try:
+                self.poly.updateProfile()
+                LOGGER.info('Profile uploaded to ISY')
+            except Exception as e:
+                LOGGER.warning(f'updateProfile failed: {e}')
+            self._profile_written = True
 
         self._async.submit(
-            self._connect(host, port, api_token, verify, webhook_host, webhook_port))
+            self._supervisor(host, port, api_token, verify, webhook_host, webhook_port),
+            'connection supervisor')
 
-    async def _connect(self, host, port, api_token, verify_ssl,
-                       webhook_host='', webhook_port=7777):
+    async def _supervisor(self, host, port, api_token, verify_ssl,
+                          webhook_host='', webhook_port=7777):
+        """Owns the whole connection lifecycle.
+
+        First connect and reconnect-after-an-outage are deliberately the same
+        code path: a failure at any stage just falls through to the backoff and
+        tries again. Nothing here is one-shot, so a plugin that starts before
+        the network is up simply retries until the network arrives.
+        """
         try:
-            LOGGER.info(f'Connecting to UniFi Access at {host}:{port}')
-            self._client = AccessClient(host, port, api_token, verify_ssl)
-            await self._client.connect()
-
-            # Start webhook server if configured
-            if webhook_host:
-                await self._start_webhook(webhook_host, webhook_port)
-
-            # Give ISY a moment to process the profile update before adding nodes
-            await asyncio.sleep(3)
-            await self._fetch_and_discover()
-            LOGGER.info('Listening for WebSocket events')
-            await self._ws_loop()
-        except Exception as e:
-            LOGGER.error(f'Connection failed: {e}', exc_info=True)
-            self.poly.Notices['error'] = f'Connection failed: {e}'
+            await self._supervise(host, port, api_token, verify_ssl,
+                                  webhook_host, webhook_port)
+        finally:
+            # Every exit path — clean stop or an unexpected crash — must clear
+            # this, or the shortPoll safety net won't restart us and we're a
+            # zombie again.
+            LOGGER.info('Connection supervisor stopped')
             self._initialized = False
-            if self._client:
-                await self._client.close()
-                self._client = None
 
-    async def _ws_loop(self):
+    async def _supervise(self, host, port, api_token, verify_ssl,
+                         webhook_host='', webhook_port=7777):
         backoff = 5
-        connected = False
-        while self._initialized:
+        first = True
+        while self._running:
             try:
-                if not connected:
-                    self.setDriver('ST', 1)
-                    connected = True
-                await self._client.listen(self._on_ws_message)
+                LOGGER.info(f'Connecting to UniFi Access at {host}:{port}')
+                self._client = AccessClient(host, port, api_token, verify_ssl)
+                await self._client.connect()
+
+                if first:
+                    # Let ISY digest the profile upload before we add nodes
+                    await asyncio.sleep(3)
+                    first = False
+
+                # REST first: proves routing, TLS and token before we commit
+                # to a WebSocket, and gives a clean error if any of them fail.
+                await self._fetch_and_discover()
+
+                # Re-registered on EVERY connect. Registering once at startup
+                # left doorbells silently dead after any reconnect.
+                if webhook_host:
+                    await self._ensure_webhook(webhook_host, webhook_port)
+
+                LOGGER.info('Listening for WebSocket events')
+                backoff = 5
+                # _mark_online fires from inside, once the socket is truly up.
+                await self._client.listen(self._on_ws_message,
+                                          on_connect=self._mark_online)
+                LOGGER.warning('WebSocket closed by peer')
+                self._mark_offline('WebSocket closed')
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                LOGGER.warning(f'WebSocket disconnected: {e} — reconnecting in {backoff}s')
-            self.setDriver('ST', 0)
-            connected = False
-            if not self._initialized:
+                self._mark_offline(e)
+
+            await self._teardown_client()
+            if not self._running:
                 break
+            LOGGER.info(f'Retrying in {backoff}s')
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
+
+    async def _teardown_client(self):
+        self.setDriver('ST', 0)
+        client, self._client = self._client, None
+        if client:
             try:
-                await self._client.reconnect()
-                await self._fetch_and_discover()
-                backoff = 5
+                await client.close()
             except Exception as e:
-                LOGGER.warning(f'Reconnect failed: {e}')
+                LOGGER.debug(f'Error closing client: {e}')
+
+    def _mark_online(self):
+        """Called only when the WebSocket is genuinely established."""
+        self.setDriver('ST', 1)
+        if self._down_since is not None:
+            down_min = (time.time() - self._down_since) / 60
+            LOGGER.info(f'Connection restored after {down_min:.1f} min offline')
+            self._down_since = None
+        self.poly.Notices.delete('offline')
+
+    def _mark_offline(self, err):
+        """Track a sustained outage: surface it, then self-restart if it persists."""
+        now = time.time()
+        if self._down_since is None:
+            self._down_since = now
+        down_sec = now - self._down_since
+        LOGGER.warning(f'Connection failed (down {down_sec / 60:.1f} min): {err}')
+
+        if down_sec >= _NOTICE_AFTER_SEC:
+            self.poly.Notices['offline'] = (
+                f'No connection to UniFi Access for {down_sec / 60:.0f} min: {err}')
+
+        if not self._watchdog_minutes or down_sec < self._watchdog_minutes * 60:
+            return
+
+        # Sustained outage. Restarting is a blunt last resort — the retry loop
+        # above is the real recovery path, and restart() is a no-op anyway if
+        # MQTT never came up. Cooldown is persisted so it survives the restart
+        # it just caused; without that this would reboot-loop.
+        last = float(self._data.get('last_restart') or 0)
+        if now - last < _RESTART_COOLDOWN_SEC:
+            return
+        self._data['last_restart'] = now
+        LOGGER.error(f'No connection for {down_sec / 60:.0f} min — restarting plugin')
+        try:
+            self.poly.restart()
+        except Exception as e:
+            LOGGER.error(f'Self-restart failed: {e}')
 
     # ------------------------------------------------------------------
     # Discovery
@@ -777,7 +948,11 @@ class Controller(udi_interface.Node):
                 or len(self._policies) != old_policies):
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._save_and_rebuild_profile)
-        self._discover(doors, devices)
+        # _discover blocks waiting for ISY to confirm each addNode. Run it off
+        # the event loop or a large discovery starves the webhook server and
+        # the WebSocket heartbeat, which drops the socket mid-discovery.
+        await asyncio.get_event_loop().run_in_executor(
+            None, self._discover, doors, devices)
 
     def _discover(self, doors: list, devices: list):
         door_id_to_addr = {}
@@ -858,32 +1033,40 @@ class Controller(udi_interface.Node):
         if not dev_id:
             return None
         address = _make_address(dev_id)
-        if address in self._readers:
-            return self._readers[address]
-        name = dev.get('alias') or dev.get('name') or dev_id
-        # ISY only supports 2-level hierarchy; all nodes must be children of controller
-        node = ReaderNode(self.poly, self.address, address, name, dev_id)
-        self._add_node_wait(node, timeout=3)
-        self._readers[address]      = node
+        node = self._readers.get(address)
+        if node is None:
+            name = dev.get('alias') or dev.get('name') or dev_id
+            # ISY only supports 2-level hierarchy; all nodes must be children of controller
+            node = ReaderNode(self.poly, self.address, address, name, dev_id)
+            self._add_node_wait(node, timeout=3)
+            self._readers[address] = node
+            LOGGER.info(f'Added reader: {name} ({address}) under {door_address}')
+        # Index maintenance runs even for an existing node: a reader created
+        # during a partial discovery can be filed under the wrong door, and
+        # an early return would leave that wrong forever.
         self._reader_by_dev[dev_id] = node
-        self._readers_by_door.setdefault(door_address, []).append(node)
-        LOGGER.info(f'Added reader: {name} ({address}) under {door_address}')
+        by_door = self._readers_by_door.setdefault(door_address, [])
+        if node not in by_door:
+            by_door.append(node)
         return node
 
     def _ensure_configured_reader(self, dev_id: str, name: str, door_address: str,
                                    entry_exit: str = ''):
         """Create (or reuse) a reader node for a configured Protect doorbell."""
         address = _make_address(dev_id)
-        if address in self._readers:
-            return self._readers[address]
-        node = ReaderNode(self.poly, self.address, address, name, dev_id)
-        self._add_node_wait(node, timeout=3)
-        self._readers[address] = node
+        node = self._readers.get(address)
+        if node is None:
+            node = ReaderNode(self.poly, self.address, address, name, dev_id)
+            self._add_node_wait(node, timeout=3)
+            self._readers[address] = node
+            LOGGER.info(f'Added configured reader: {name} ({address}) dev={dev_id[:12]}... {entry_exit or ""}')
+        # See _ensure_reader: indexes are refreshed even on the reuse path.
         self._reader_by_dev[dev_id] = node
-        self._readers_by_door.setdefault(door_address, []).append(node)
+        by_door = self._readers_by_door.setdefault(door_address, [])
+        if node not in by_door:
+            by_door.append(node)
         if entry_exit:
             self._reader_by_entry[(door_address, entry_exit)] = node
-        LOGGER.info(f'Added configured reader: {name} ({address}) dev={dev_id[:12]}... {entry_exit or ""}')
         return node
 
     def _auto_create_reader(self, dev_id: str, door_id: str):
@@ -978,6 +1161,17 @@ class Controller(udi_interface.Node):
         self._ring_doorbell(dev_id=dev_id, door_id=door_id)
 
     def _ring_doorbell(self, dev_id: str, door_id: str):
+        # One press can arrive twice: the WebSocket access.remote_view event
+        # and the access.doorbell.incoming webhook. ring() uses force=True, so
+        # without this ISY sees two Control events and every doorbell program
+        # fires twice.
+        key = dev_id or door_id or '?'
+        now = time.time()
+        if now - self._last_ring.get(key, 0) < _RING_DEDUP_SEC:
+            LOGGER.debug(f'Ignoring duplicate doorbell ring for {key[:12]}')
+            return
+        self._last_ring[key] = now
+
         reader = self._reader_by_dev.get(dev_id)
         if not reader and dev_id:
             # Unknown device — auto-create a reader node for it
@@ -1051,35 +1245,46 @@ class Controller(udi_interface.Node):
     # Webhook
     # ------------------------------------------------------------------
 
-    async def _start_webhook(self, webhook_host: str, webhook_port: int):
+    async def _ensure_webhook(self, webhook_host: str, webhook_port: int):
+        """Bring up the local listener and (re)register it with the controller.
+
+        Called on every connect. Registration failure must not prevent the
+        local listener from running, and must not abort the connection —
+        previously either one left doorbells permanently dead while the plugin
+        still reported healthy.
+        """
+        if not self._webhook_started:
+            try:
+                self._webhook_server = WebhookServer(webhook_port,
+                                                     self._on_webhook_doorbell)
+                await self._webhook_server.start()
+                self._webhook_started = True
+            except Exception as e:
+                LOGGER.error(f'Webhook server failed to bind port {webhook_port}: {e}')
+                self._webhook_server = None
+                self.poly.Notices['webhook'] = (
+                    f'Doorbell listener could not bind port {webhook_port}: {e}')
+                return
+
         url = f'http://{webhook_host}:{webhook_port}/webhook'
-        # Load persisted webhook ID, fall back to searching by name
-        saved_id = None
         try:
-            with open(_WEBHOOK_FILE) as f:
-                saved_id = json.load(f).get('id')
-        except FileNotFoundError:
-            pass
-        except Exception as e:
-            LOGGER.warning(f'Failed to load webhook state: {e}')
-
-        if not saved_id:
-            saved_id = await self._client.find_webhook('udi-unifiaccess-poly')
-            if saved_id:
-                LOGGER.info(f'Found existing webhook by name (id={saved_id})')
-
-        try:
-            info = await self._client.register_webhook(url, saved_id)
-            self._webhook_id = info.get('id')
-            with open(_WEBHOOK_FILE, 'w') as f:
-                json.dump({'id': self._webhook_id}, f)
+            # Look the ID up by name every time rather than trusting a cached
+            # one — a stale ID from a previous run 404s on update, and that
+            # used to be unrecoverable.
+            existing = await self._client.find_webhook(_WEBHOOK_NAME)
+            info = await self._client.register_webhook(url, existing)
+            self._webhook_id = info.get('id') or existing
+            try:
+                with open(_WEBHOOK_FILE, 'w') as f:
+                    json.dump({'id': self._webhook_id}, f)
+            except Exception as e:
+                LOGGER.debug(f'Could not persist webhook id: {e}')
             LOGGER.info(f'Webhook registered: {url} (id={self._webhook_id})')
+            self.poly.Notices.delete('webhook')
         except Exception as e:
+            self._webhook_id = None
             LOGGER.warning(f'Webhook registration failed: {e}')
-            return
-
-        self._webhook_server = WebhookServer(webhook_port, self._on_webhook_doorbell)
-        await self._webhook_server.start()
+            self.poly.Notices['webhook'] = f'Doorbell webhook not registered: {e}'
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1103,7 +1308,10 @@ class Controller(udi_interface.Node):
 
     def unlock_door(self, door_id: str):
         if self._client:
-            self._async.submit(self._do_unlock(door_id))
+            self._async.submit(self._do_unlock(door_id), 'unlock door')
+        else:
+            # Never fail an unlock silently — this is a door.
+            LOGGER.error(f'Cannot unlock {door_id}: no connection to UniFi Access')
 
     async def _do_unlock(self, door_id: str):
         try:
@@ -1120,8 +1328,17 @@ class Controller(udi_interface.Node):
     # ------------------------------------------------------------------
 
     def poll(self, flag):
+        # Safety net for the case the supervisor never started at all: a
+        # startup callback that didn't fire, a crashed handler thread, or
+        # params that arrived late. shortPoll (60s) rather than longPoll so
+        # recovery is a minute, not ten.
+        if flag == 'shortPoll':
+            if not self._initialized and self._is_configured():
+                LOGGER.warning('No connection supervisor running — starting one')
+                self._try_connect()
+            return
         if flag == 'longPoll' and self._initialized and self._client:
-            self._async.submit(self._fetch_and_discover())
+            self._async.submit(self._fetch_and_discover(), 'longPoll discover')
 
     # ------------------------------------------------------------------
     # Commands
@@ -1136,7 +1353,7 @@ class Controller(udi_interface.Node):
         if not self._initialized:
             self._try_connect()
         elif self._client:
-            self._async.submit(self._fetch_and_discover())
+            self._async.submit(self._fetch_and_discover(), 'manual discover')
 
     def cmd_set_grp_policy(self, command):
         group_idx  = _cmd_param(command, 'group',  25)
@@ -1151,7 +1368,7 @@ class Controller(udi_interface.Node):
         policy = self._policies[policy_idx]
         LOGGER.info(f'Setting group "{group["name"]}" → policy "{policy["name"]}"')
         self._async.submit(
-            self._do_set_group_policy(group['id'], policy['id']))
+            self._do_set_group_policy(group['id'], policy['id']), 'set group policy')
 
     async def _do_set_group_policy(self, group_id: str, policy_id: str):
         try:
@@ -1174,7 +1391,7 @@ class Controller(udi_interface.Node):
         user_name = self._users._num_to_name.get(user_idx, user_idx)
         LOGGER.info(f'Setting user "{user_name}" → policy "{policy["name"]}"')
         self._async.submit(
-            self._do_set_user_policy(user_uuid, policy['id']))
+            self._do_set_user_policy(user_uuid, policy['id']), 'set user policy')
 
     async def _do_set_user_policy(self, user_id: str, policy_id: str):
         try:
